@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""pi.py — Raspberry Pi side of picontrol: a console-only controller bridge.
+
+Listens for JSON ops over HTTP (stdlib http.server, threaded), dispatches them
+to gpiozero, and logs every transaction on the console. No UI beyond the log.
+
+Third-party imports: gpiozero ONLY — enforced by tests/test_import_boundary.py.
+
+Run on the Pi:
+    pip install gpiozero              # or: apt install python3-gpiozero
+    python3 pi.py --port 8642
+
+Run on the PC (development: mock pins + synthetic sensor values):
+    uv run python src/pi.py --dev
+
+Part of the 3-file copy set for deployment: pi.py + pins.py + protocol.py
+(flat siblings — copy them to any folder and `python3 pi.py` runs).
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import threading
+import time
+import traceback
+import warnings
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import gpiozero
+
+import pins
+import protocol
+from pins import PinProfile, Role
+from protocol import Op, OpResult, PinState, ProtocolError
+
+# Direction strings reported by GET /state (kept small for the wire).
+_DIRECTION = {
+    Role.OUTPUT: "out",
+    Role.INPUT: "in",
+    Role.PWM: "pwm",
+    Role.SENSOR: "sensor",
+}
+
+# Dev-mode synthetic sensor readings (DHT22 / HC-SR04 can't be timing-emulated
+# through mock pins, so --dev serves smooth plausible values instead).
+_SYNTHETIC = {
+    "DHT22": lambda t: round(21.0 + 2.0 * math.sin(t / 60.0), 1),
+    "HCSR04": lambda t: round(0.6 + 0.4 * math.sin(t / 15.0), 2),
+}
+
+
+def _log(req_id: int, description: str, result: OpResult) -> None:
+    """One console line per transaction — pi.py's 'view'."""
+    stamp = time.strftime("%H:%M:%S")
+    mark = "ok" if result.ok else f"ERR {result.error}"
+    print(f"{stamp} #{req_id} -> {description:<38} <- {mark}", flush=True)
+
+
+def _describe(op: Op) -> str:
+    if op.op in protocol.SYSTEM_OPS:
+        return op.op
+    text = f"{op.op} pin {op.pin}"
+    if op.value is not None:
+        text += f" = {op.value}"
+    return text
+
+
+def _level(value) -> bool | None:
+    """Accept true/1/false/0 as a wire level; anything else -> None."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    return None
+
+
+class Dispatcher:
+    """Validates ops against the pin profile, then executes them via gpiozero.
+
+    Devices are constructed once and cached (dict bcm -> device). Construction
+    and execution happen in whatever thread the HTTP server hands us; a coarse
+    lock guards the cache so two concurrent requests never build a device
+    twice.
+    """
+
+    def __init__(self, *, dev: bool = False) -> None:
+        self.dev = dev
+        self._devices: dict[int, object] = {}
+        self._ctor_lock = threading.Lock()
+        self._started = time.monotonic()
+
+    # ------------------------------------------------------------- devices --
+
+    def _device(self, profile: PinProfile):
+        assert profile.bcm is not None, "cannot build a device without a BCM pin"
+        dev = self._devices.get(profile.bcm)
+        if dev is not None:
+            return dev
+        with self._ctor_lock:
+            dev = self._devices.get(profile.bcm)
+            if dev is None:
+                dev = self._create(profile)
+                self._devices[profile.bcm] = dev
+        return dev
+
+    def _create(self, profile: PinProfile):
+        drv, role, bcm = profile.driver, profile.role, profile.bcm
+        if role is Role.OUTPUT:
+            if drv == "Buzzer":
+                return gpiozero.Buzzer(bcm)
+            return gpiozero.LED(bcm, active_high=not profile.active_low)
+        if role is Role.INPUT:
+            if drv == "MotionSensor":
+                return gpiozero.MotionSensor(bcm)
+            return gpiozero.Button(bcm, pull_up=profile.pull_up)
+        if role is Role.PWM:
+            return gpiozero.PWMLED(bcm)
+        if role is Role.SENSOR:
+            if drv == "DHT22":
+                return gpiozero.DHT22(bcm)
+            if drv == "HCSR04":
+                return gpiozero.DistanceSensor(trigger=bcm, echo=profile.echo)
+        raise RuntimeError(f"cannot build a device for {profile.name} ({drv}/{role})")
+
+    # ------------------------------------------------------------- sensors --
+
+    def _synthetic(self, profile: PinProfile) -> float:
+        fn = _SYNTHETIC.get(profile.driver)
+        if fn is None:
+            raise RuntimeError(f"no synthetic reading for driver {profile.driver!r}")
+        return fn(time.monotonic() - self._started)
+
+    def _read_sensor(self, profile: PinProfile) -> float:
+        if profile.needs_adc:
+            raise RuntimeError("needs an ADC (not fitted)")
+        if self.dev:
+            return self._synthetic(profile)
+        dev = self._device(profile)
+        if profile.driver == "DHT22":
+            value = dev.temperature
+            if value is None:
+                raise RuntimeError("DHT22: no reading yet")
+            return float(value)
+        if profile.driver == "HCSR04":
+            return float(dev.distance)
+        raise RuntimeError(f"unknown sensor driver {profile.driver!r}")
+
+    # ------------------------------------------------------------ execution --
+
+    def dispatch(self, op: Op) -> OpResult:
+        """Entry point for POST /op: never raises, never leaks a traceback."""
+        try:
+            result = self._dispatch(op)
+        except Exception as ex:  # noqa: BLE001 — boundary: log it, report it
+            traceback.print_exc()
+            result = OpResult(ok=False, req_id=op.req_id,
+                              error=f"internal error: {type(ex).__name__}: {ex}")
+        _log(op.req_id, _describe(op), result)
+        return result
+
+    def _dispatch(self, op: Op) -> OpResult:
+        req = op.req_id
+        if op.op == "noop":
+            return OpResult(ok=True, req_id=req)
+        if op.op == "all_off":
+            return OpResult(ok=True, req_id=req, value=self.all_off())
+
+        profile = pins.PROFILE.get(op.pin)
+        if profile is None:
+            return OpResult(ok=False, req_id=req,
+                            error=f"pin {op.pin} is not in the profile")
+        if profile.needs_adc:
+            return OpResult(ok=False, req_id=req,
+                            error=f"{profile.name}: needs an ADC (not fitted)")
+        if op.op not in pins.ops_for(profile.role):
+            return OpResult(
+                ok=False, req_id=req,
+                error=f"'{op.op}' not allowed on {profile.name} ({profile.role.value})")
+
+        if op.op == "set_input" and not self.dev:
+            return OpResult(ok=False, req_id=req,
+                            error="set_input is only available in --dev mode")
+
+        if op.op == "digital_write":
+            level = _level(op.value)
+            if level is None:
+                return OpResult(ok=False, req_id=req,
+                                error="value must be true/false or 1/0")
+            dev = self._device(profile)
+            dev.on() if level else dev.off()
+            return OpResult(ok=True, req_id=req, value=bool(level))
+
+        if op.op == "pwm_write":
+            value = op.value
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return OpResult(ok=False, req_id=req,
+                                error="value must be a number 0..100")
+            if not 0 <= value <= 100:
+                return OpResult(ok=False, req_id=req,
+                                error="PWM value must be 0..100")
+            dev = self._device(profile)
+            dev.value = float(value) / 100.0
+            return OpResult(ok=True, req_id=req, value=float(value))
+
+        if op.op == "pulse":
+            duration_ms = 500 if op.value is None else op.value
+            if isinstance(duration_ms, bool) or not isinstance(duration_ms, (int, float)):
+                return OpResult(ok=False, req_id=req,
+                                error="value must be a duration in ms (1..10000)")
+            if not 1 <= duration_ms <= 10000:
+                return OpResult(ok=False, req_id=req,
+                                error="pulse duration must be 1..10000 ms")
+            dev = self._device(profile)
+            dev.on()
+            try:
+                time.sleep(duration_ms / 1000.0)
+            finally:
+                dev.off()  # always leave the pin quiet, even on interrupt
+            return OpResult(ok=True, req_id=req, value=float(duration_ms))
+
+        if op.op == "digital_read":
+            dev = self._device(profile)
+            return OpResult(ok=True, req_id=req, value=bool(dev.value))
+
+        if op.op == "read":
+            return OpResult(ok=True, req_id=req, value=self._read_sensor(profile))
+
+        if op.op == "set_input":
+            level = _level(op.value)
+            if level is None:
+                return OpResult(ok=False, req_id=req,
+                                error="value must be true/false or 1/0")
+            dev = self._device(profile)
+            # pull-up input (Button): pressed pulls the wire LOW;
+            # active-high input (MotionSensor): pressed drives it HIGH.
+            wire_high = (not level) if dev.pull_up else level
+            (dev.pin.drive_high() if wire_high else dev.pin.drive_low())
+            return OpResult(ok=True, req_id=req, value=bool(level))
+
+        return OpResult(ok=False, req_id=req, error=f"unhandled op '{op.op}'")
+
+    def all_off(self) -> int:
+        """Safety net: de-energise every output/PWM device. Returns count."""
+        off = 0
+        for profile in pins.PROFILE.values():
+            if profile.role not in (Role.OUTPUT, Role.PWM) or profile.needs_adc:
+                continue
+            try:
+                dev = self._device(profile)
+                if profile.role is Role.PWM:
+                    dev.value = 0.0
+                else:
+                    dev.off()
+                off += 1
+            except Exception as ex:  # noqa: BLE001 — one line per device, keep going
+                print(f"all_off: {profile.name} failed: "
+                      f"{type(ex).__name__}: {ex}",
+                      file=sys.stderr, flush=True)
+        return off
+
+    # --------------------------------------------------------------- state --
+
+    def state(self) -> list[PinState]:
+        """One row per wired device — a single GET refreshes the whole GUI."""
+        return [self._state_row(p) for p in pins.PROFILE.values()]
+
+    def _state_row(self, profile: PinProfile) -> PinState:
+        direction = _DIRECTION.get(profile.role, "out")
+        if profile.needs_adc:
+            return PinState(bcm=profile.bcm, direction=direction, unit=profile.unit,
+                            fault="needs an ADC (not fitted)")
+        try:
+            if profile.role is Role.SENSOR:
+                return PinState(bcm=profile.bcm, direction=direction,
+                                value=self._read_sensor(profile), unit=profile.unit)
+            dev = self._device(profile)
+            if profile.role is Role.PWM:
+                value: float | bool = round(dev.value * 100.0, 1)
+                return PinState(bcm=profile.bcm, direction=direction, value=value,
+                                unit="%")
+            return PinState(bcm=profile.bcm, direction=direction,
+                            value=bool(dev.value))
+        except Exception as ex:  # noqa: BLE001 — surface on the card, keep serving
+            return PinState(bcm=profile.bcm, direction=direction, unit=profile.unit,
+                            fault=f"{type(ex).__name__}: {ex}")
+
+
+class _Handler(BaseHTTPRequestHandler):
+    """Two endpoints: POST /op and GET /state. JSON only, CORS-friendly."""
+
+    dispatcher: Dispatcher | None = None  # bound in main()
+    server_version = "picontrol"
+    sys_version = ""  # don't advertise the Python version
+
+    def _reply(self, status: int, payload: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _path(self) -> str:
+        return self.path.split("?", 1)[0]
+
+    def do_OPTIONS(self) -> None:  # CORS preflight (web-build clients)
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        if self._path() != "/op":
+            self._reply(404, protocol.encode_result(
+                OpResult(ok=False, error="unknown endpoint (use POST /op)")))
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        body = self.rfile.read(min(max(length, 0), protocol.MAX_BODY + 1))
+        try:
+            op = protocol.parse_op(body)
+        except ProtocolError as ex:
+            result = OpResult(ok=False, error=str(ex))
+            _log(0, f"malformed: {body[:60]!r}", result)
+            self._reply(400, protocol.encode_result(result))
+            return
+        result = self.dispatcher.dispatch(op)
+        self._reply(200 if result.ok else 400, protocol.encode_result(result))
+
+    def do_GET(self) -> None:
+        if self._path() != "/state":
+            self._reply(404, protocol.encode_result(
+                OpResult(ok=False, error="unknown endpoint (use GET /state)")))
+            return
+        try:
+            states = self.dispatcher.state()
+        except Exception as ex:  # noqa: BLE001 — last-resort boundary
+            traceback.print_exc()
+            self._reply(500, protocol.encode_result(
+                OpResult(ok=False, error=f"state failed: {type(ex).__name__}")))
+            return
+        self._reply(200, protocol.encode_state(states))
+
+    def log_message(self, fmt: str, *args) -> None:
+        pass  # transaction log above replaces the default stderr access log
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="pi.py", description="picontrol controller bridge for Raspberry Pi")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="bind address (default: all interfaces)")
+    parser.add_argument("--port", type=int, default=protocol.DEFAULT_PORT,
+                        help=f"TCP port (default: {protocol.DEFAULT_PORT})")
+    parser.add_argument("--dev", action="store_true",
+                        help="mock pins + synthetic sensor values (no Pi hardware)")
+    args = parser.parse_args(argv)
+
+    if args.dev:
+        # Must be set before the first device construction (the pin factory
+        # reads these lazily on first use).
+        os.environ["GPIOZERO_PIN_FACTORY"] = "mock"
+        os.environ["GPIOZERO_MOCK_PIN_CLASS"] = "mockpwmpin"
+
+    # Resolve the pin factory NOW so a machine without GPIO (e.g. a PC
+    # started without --dev) fails fast with a clear message instead of
+    # serving and exploding on the first request / at shutdown.
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # hide gpiozero's fallback spam
+            gpiozero.Device.ensure_pin_factory()
+    except Exception as ex:
+        print(f"pi.py: no usable GPIO pin factory "
+              f"({type(ex).__name__}: {ex})",
+              file=sys.stderr, flush=True)
+        print("pi.py:   on a Raspberry Pi: install lgpio "
+              "(sudo apt install python3-lgpio) or RPi.GPIO",
+              file=sys.stderr, flush=True)
+        print("pi.py:   on a PC without hardware: run with --dev "
+              "(mock pins + synthetic sensors)",
+              file=sys.stderr, flush=True)
+        return 1
+
+    dispatcher = Dispatcher(dev=args.dev)
+    handler = type("BoundHandler", (_Handler,), {"dispatcher": dispatcher})
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), handler)
+    except OSError as ex:
+        print(f"pi.py: cannot bind {args.host}:{args.port}: {ex}",
+              file=sys.stderr, flush=True)
+        return 1
+
+    if args.dev:
+        mode = "dev: mock pins + synthetic sensors"
+    else:
+        mode = f"live GPIO via {type(gpiozero.Device.pin_factory).__name__}"
+    print(f"picontrol bridge listening on {args.host}:{args.port} [{mode}]",
+          flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\npi.py: shutting down", flush=True)
+    finally:
+        turned_off = dispatcher.all_off()  # leave the hardware quiet
+        if turned_off:
+            print(f"pi.py: switched off {turned_off} output(s)", flush=True)
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

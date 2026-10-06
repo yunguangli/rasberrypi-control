@@ -1,0 +1,11 @@
+I want to make a remote control of my rasberry board from my PC/laptop. 
+PC side will push formated gpio zero commands  , https://gpiozero.readthedocs.io/en/stable/  . the entry point shall be ./src/main.py
+pi side will interpret it into real gpio zero command and return status and/or sensor outputs
+there should be GUI on the PC side . use Python Flet (>=1.0). use flet mcp for syntex checking
+pi side is  a command line transceiver app and display status on console.  name it pi.py as the entry point.  
+I don't have a rasberry pi board with me yet. so pi.py will simply echo what it receives and prepares for gpio call. 
+
+I wonder how shall we approach this? shall we run a mini webserver so that the pi and PC will talk to it? Or Shall we do 
+p2p link like in C:\Users\yunguang\OneDrive - Trilogy Partners Limited\Documents\coding\fax-demo\src\lanlink ? 
+
+use professional architectue like mvc or others  and Dataclass.
