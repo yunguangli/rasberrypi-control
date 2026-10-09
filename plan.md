@@ -149,7 +149,12 @@ with `400 {"ok": false, …}`; the GUI never builds a control that would fail.
   MB of RSS and near-zero CPU between polls. Devices are constructed **once** and cached
   (dict bcm → device), never per request.
 - **Third-party imports: gpiozero only.** Everything else (`http.server`, `json`, `socket`,
-  `logging`, `argparse`) is stdlib. Enforced by the import-boundary test (§7).
+  `logging`, `argparse`) is stdlib. Enforced by the import-boundary test (§7). One optional
+  exception: the DHT22 temperature sensor — gpiozero has **no DHT driver** (gpiozero issue
+  #254 is still open), so `pi.py` uses `gpiozero.DHT22` if a build ever ships one, else the
+  Adafruit CircuitPython driver **only when installed** (`pip install
+  adafruit-circuitpython-dht`); with neither present the card shows a clear fault instead
+  of an AttributeError. Both imports are lazy, so they are listed in the boundary allowlist.
 - Console view: one line per transaction, e.g.
   `12:01:04 #42 → digital_write 17 = 1    ← ok`.
 - CLI: `python3 pi.py --port 8642 [--dev] [--host 0.0.0.0]`.

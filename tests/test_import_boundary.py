@@ -22,7 +22,11 @@ STDLIB = sys.stdlib_module_names  # Python >= 3.10
 # filename -> allowed top-level import roots
 BOUNDARY = {
     "main.py":     {"flet", "pins", "protocol"},
-    "pi.py":       {"gpiozero", "pins", "protocol"},
+    # adafruit_circuitpython_dht/board: optional DHT22 driver, imported lazily
+    # inside _dht22() — absent on most machines (the deploy test imports pi
+    # without it, so a top-level import of either would still fail).
+    "pi.py":       {"gpiozero", "pins", "protocol",
+                    "adafruit_circuitpython_dht", "board"},
     "pins.py":     set(),
     "protocol.py": set(),
 }

@@ -1,5 +1,37 @@
 # Picontrol app
 
+Remote control of a Raspberry Pi over LAN: the Flet GUI (`src/main.py`) sends JSON ops
+over HTTP to a console-only bridge (`src/pi.py`) that drives gpiozero. The two sides are
+independent programs that never share imports — `tests/test_import_boundary.py` enforces it.
+
+## Pi bridge (Raspberry Pi)
+
+Only these three flat sibling files are copied to the Pi: `pi.py`, `pins.py`,
+`protocol.py` (from `src/`).
+
+```bash
+pip install gpiozero              # or: sudo apt install python3-gpiozero
+python3 pi.py --port 8642         # defaults: --host 0.0.0.0, port 8642
+```
+
+Logs one line per transaction; `GET /state` and `POST /op` are the only endpoints.
+
+**Temperature sensor note:** gpiozero has no DHT22 driver (gpiozero issue #254 is still
+open), so the "Room temp" card shows a clear fault until the optional Adafruit driver
+is installed on the Pi:
+
+```bash
+sudo apt install libgpiod2
+pip install adafruit-circuitpython-dht
+```
+
+Run the bridge on a PC instead (no hardware — mock pins + synthetic sensor values, plus
+the dev-only `set_input` op to simulate button/PIR presses):
+
+```powershell
+uv run python src/pi.py --dev
+```
+
 ## Run the app
 
 ### uv

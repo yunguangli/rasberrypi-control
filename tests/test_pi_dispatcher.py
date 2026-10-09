@@ -15,6 +15,7 @@ from http.server import ThreadingHTTPServer
 import gpiozero
 import pytest
 
+import pins
 import pi
 import protocol
 from protocol import Op, parse_result, parse_state
@@ -145,6 +146,45 @@ def test_distance_read_is_synthetic(dsp):
 def test_light_sensor_reports_missing_adc(dsp):
     res = dsp.dispatch(Op("read", pin=-1))
     assert not res.ok and "ADC" in res.error
+
+
+def test_dht22_without_a_driver_is_a_clear_fault(capsys):
+    """gpiozero has no DHT22 class (issue #254): a read must come back as
+    advice the card can show, never an AttributeError + traceback."""
+    real = pi.Dispatcher(dev=False)  # dev mode serves synthetic values instead
+    res = real.dispatch(Op("read", pin=4))
+    assert not res.ok
+    assert "DHT22" in res.error and "adafruit-circuitpython-dht" in res.error
+
+    # second read: the failure is cached, and still never a traceback
+    assert not real.dispatch(Op("read", pin=4)).ok
+    row = {s.bcm: s for s in real.state()}[4]
+    assert row.value is None and "DHT22" in row.fault
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+
+    # release the mock pins this dispatcher claimed (gpiozero reserves the
+    # HC-SR04's pins until the device is closed — the next test needs them)
+    for device in real._devices.values():
+        device.close()
+
+
+def test_distance_read_never_blocks(dsp):
+    """partial=True on DistanceSensor: an unwired HC-SR04 (echo never fires)
+    must not hang GET /state — gpiozero's default waits for a full sample
+    queue that would never fill."""
+    dev = dsp._device(pins.PROFILE[5])
+    box: dict = {}
+
+    def read():
+        box["value"] = dev.distance
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    thread.join(2.0)
+    assert not thread.is_alive(), "DistanceSensor.distance blocked — partial=True missing?"
+    assert isinstance(box.get("value"), float)
+    dev.close()  # release the mock pins and stop the sample thread
 
 
 # -------------------------------------------------- validation boundaries ----
@@ -299,4 +339,26 @@ def test_all_off_reports_one_line_per_failure(dsp, monkeypatch, capsys):
     assert result.ok and result.value == 0
     err = capsys.readouterr().err
     assert "Traceback" not in err
-    assert "all_off: Status LED failed: RuntimeError: no hardware" in err
+    assert "all_off: Status LED failed: DeviceError: RuntimeError: no hardware" in err
+
+
+def test_failed_construction_is_structured_and_cached(dsp, monkeypatch, capsys):
+    """A device that won't construct is a DeviceError: structured on the wire,
+    no traceback, and retried only after _DEVICE_RETRY_SECONDS."""
+    attempts: list[int] = []
+
+    def _boom(profile):
+        attempts.append(profile.bcm)
+        raise RuntimeError("no hardware")
+
+    monkeypatch.setattr(dsp, "_create", _boom)
+
+    res = dsp.dispatch(Op("digital_read", pin=17))
+    assert not res.ok and res.error == "RuntimeError: no hardware"
+    res = dsp.dispatch(Op("digital_read", pin=17))
+    assert not res.ok and res.error == "RuntimeError: no hardware"
+
+    assert attempts == [17], "the failure must be cached, not retried"
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "internal error" not in captured.out

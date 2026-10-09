@@ -19,8 +19,9 @@ Build order (§8 of `plan.md`) is implemented:
 - Run web: `uv run flet run --web`
 - Build: `flet build windows -v` (also: apk/ipa/macos/linux/web) — see README.
   Bare `flet` resolves to the shared venv `..\..\coding\venv` (flet 1.0.3 + flet-cli), not a
-  project env. `uv run flet …` is the reproducible form; no `.venv`/`uv.lock` exist yet, so the
-  first `uv run` syncs the dev group (flet-cli, flet-desktop, flet-web, flet[test]).
+  project env. `uv run flet …` is the reproducible form — the project has its own
+  `.venv` + `uv.lock` (flet 1.0.3, dev group: flet-cli/desktop/web, flet[test], gpiozero),
+  which `uv run` keeps in sync.
 - Tests: `uv run pytest`; single test: `uv run pytest tests/test_main.py::test_gui_renders_from_profile`.
   `flet test` runs the same suite.
 - Pi side on this PC (no hardware): `uv run python src/pi.py --dev` — mock pins +
@@ -48,4 +49,4 @@ Build order (§8 of `plan.md`) is implemented:
 
 ## Not configured
 - No lint, formatter, typecheck, codegen, CI, or pre-commit config exists — don't guess commands.
-- Not a git repo (as of 2026-10-06).
+- Git repo with a single `first commit` (it is version-controlled as of 2026-10-07).

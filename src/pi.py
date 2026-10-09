@@ -4,7 +4,9 @@
 Listens for JSON ops over HTTP (stdlib http.server, threaded), dispatches them
 to gpiozero, and logs every transaction on the console. No UI beyond the log.
 
-Third-party imports: gpiozero ONLY — enforced by tests/test_import_boundary.py.
+Third-party imports: gpiozero ONLY (enforced by tests/test_import_boundary.py),
+plus the OPTIONAL Adafruit DHT driver, imported lazily inside _dht22() and used
+only if the user installed it — gpiozero has no DHT22 class (issue #254).
 
 Run on the Pi:
     pip install gpiozero              # or: apt install python3-gpiozero
@@ -51,6 +53,52 @@ _SYNTHETIC = {
     "HCSR04": lambda t: round(0.6 + 0.4 * math.sin(t / 15.0), 2),
 }
 
+# A device that failed to construct is not retried on every poll; it is
+# retried after this many seconds (unplugging/replugging a sensor recovers
+# without restarting the bridge).
+_DEVICE_RETRY_SECONDS = 30.0
+
+
+class DeviceError(RuntimeError):
+    """A known device-level failure.
+
+    Reported as a structured error/fault (so the GUI card can show it) and
+    logged WITHOUT a traceback — construction problems are not bugs.
+    """
+
+
+def _dht22(bcm: int):
+    """Build a DHT22 temperature sensor on BCM `bcm`, exposing `.temperature`.
+
+    gpiozero has never shipped a DHT driver (gpiozero issue #254 is still
+    open), so gpiozero's own class is only used if a build ever gains one.
+    Otherwise the optional Adafruit CircuitPython driver is used when the
+    user installed it:
+
+        pip install adafruit-circuitpython-dht   # Pi also: apt install libgpiod2
+
+    With neither available this raises DeviceError carrying that advice —
+    the card then shows the reason instead of an AttributeError.
+    """
+    cls = getattr(gpiozero, "DHT22", None)
+    if cls is not None:
+        return cls(bcm)
+    try:
+        import adafruit_circuitpython_dht as adafruit_dht
+        import board
+        pin = getattr(board, f"D{bcm}", None)
+        if pin is None:
+            raise DeviceError(f"board has no D{bcm} pin (BCM numbering expected)")
+        return adafruit_dht.DHT22(pin)
+    except DeviceError:
+        raise
+    except Exception as ex:  # ImportError on a PC, board unsupported, wiring ...
+        raise DeviceError(
+            f"no DHT22 driver: gpiozero has none (gpiozero issue #254) and "
+            f"adafruit-circuitpython-dht is unavailable "
+            f"({type(ex).__name__}: {ex})"
+        ) from ex
+
 
 def _log(req_id: int, description: str, result: OpResult) -> None:
     """One console line per transaction — pi.py's 'view'."""
@@ -80,30 +128,54 @@ def _level(value) -> bool | None:
 class Dispatcher:
     """Validates ops against the pin profile, then executes them via gpiozero.
 
-    Devices are constructed once and cached (dict bcm -> device). Construction
-    and execution happen in whatever thread the HTTP server hands us; a coarse
-    lock guards the cache so two concurrent requests never build a device
-    twice.
+    Devices are constructed once and cached (dict bcm -> device); a device
+    that fails to construct is cached as an error for _DEVICE_RETRY_SECONDS
+    instead of being retried on every request. Construction and execution
+    happen in whatever thread the HTTP server hands us; a coarse lock guards
+    the cache so two concurrent requests never build a device twice.
     """
 
     def __init__(self, *, dev: bool = False) -> None:
         self.dev = dev
         self._devices: dict[int, object] = {}
+        self._failed: dict[int, tuple[str, float]] = {}   # bcm -> (msg, retry_at)
         self._ctor_lock = threading.Lock()
+        self._sensor_lock = threading.Lock()  # non-gpiozero sensor reads
         self._started = time.monotonic()
 
     # ------------------------------------------------------------- devices --
 
     def _device(self, profile: PinProfile):
         assert profile.bcm is not None, "cannot build a device without a BCM pin"
-        dev = self._devices.get(profile.bcm)
+        bcm = profile.bcm
+        dev = self._devices.get(bcm)
         if dev is not None:
             return dev
+        failure = self._failed.get(bcm)
+        if failure is not None and time.monotonic() < failure[1]:
+            raise DeviceError(failure[0])
         with self._ctor_lock:
-            dev = self._devices.get(profile.bcm)
-            if dev is None:
+            dev = self._devices.get(bcm)
+            if dev is not None:
+                return dev
+            failure = self._failed.get(bcm)
+            if failure is not None and time.monotonic() < failure[1]:
+                raise DeviceError(failure[0])
+            try:
                 dev = self._create(profile)
-                self._devices[profile.bcm] = dev
+            except Exception as ex:
+                # Cache the failure so a dead/broken device costs one clear
+                # line per call instead of a construction attempt (and a
+                # traceback) every 1.5 s. Retried after _DEVICE_RETRY_SECONDS.
+                # Callers already know which pin/device they asked about, so
+                # the message stays unprefixed.
+                message = str(ex) if isinstance(ex, DeviceError) \
+                    else f"{type(ex).__name__}: {ex}"
+                self._failed[bcm] = (message,
+                                     time.monotonic() + _DEVICE_RETRY_SECONDS)
+                raise DeviceError(message) from None
+            self._devices[bcm] = dev
+            self._failed.pop(bcm, None)
         return dev
 
     def _create(self, profile: PinProfile):
@@ -120,9 +192,13 @@ class Dispatcher:
             return gpiozero.PWMLED(bcm)
         if role is Role.SENSOR:
             if drv == "DHT22":
-                return gpiozero.DHT22(bcm)
+                return _dht22(bcm)
             if drv == "HCSR04":
-                return gpiozero.DistanceSensor(trigger=bcm, echo=profile.echo)
+                # partial=True: never block on the sample queue filling up —
+                # with no echo wired the default (partial=False) would hang
+                # GET /state forever and leak a thread per poll.
+                return gpiozero.DistanceSensor(trigger=bcm, echo=profile.echo,
+                                               partial=True)
         raise RuntimeError(f"cannot build a device for {profile.name} ({drv}/{role})")
 
     # ------------------------------------------------------------- sensors --
@@ -140,7 +216,8 @@ class Dispatcher:
             return self._synthetic(profile)
         dev = self._device(profile)
         if profile.driver == "DHT22":
-            value = dev.temperature
+            with self._sensor_lock:  # Adafruit's driver isn't multi-reader safe
+                value = dev.temperature
             if value is None:
                 raise RuntimeError("DHT22: no reading yet")
             return float(value)
@@ -154,6 +231,9 @@ class Dispatcher:
         """Entry point for POST /op: never raises, never leaks a traceback."""
         try:
             result = self._dispatch(op)
+        except DeviceError as ex:
+            # known device problem (card shows it too) — not a bug, no traceback
+            result = OpResult(ok=False, req_id=op.req_id, error=str(ex))
         except Exception as ex:  # noqa: BLE001 — boundary: log it, report it
             traceback.print_exc()
             result = OpResult(ok=False, req_id=op.req_id,

@@ -213,6 +213,10 @@ class App:
 
     def _render(self) -> None:
         """(Re)build every widget; on re-renders swap into the live shell."""
+        # Widgets in flight are gone with the old tree — if a slider drag was
+        # pending, its on_change_end will never arrive, so drop the marks
+        # rather than leaving that BCM stuck (polls would skip it forever).
+        self.pending.clear()
         self.toggles.clear()
         self.switches.clear()
         self.sliders.clear()
@@ -311,7 +315,15 @@ class App:
 
     async def _poll_loop(self) -> None:
         while True:
-            delay = await self._poll_once()
+            try:
+                delay = await self._poll_once()
+            except Exception as ex:  # never let one bad poll kill the loop
+                delay = POLL_FAIL_SECONDS
+                try:
+                    self._push_log(
+                        f"poll error: {type(ex).__name__}: {ex}", False)
+                except Exception:
+                    pass  # if the log is broken too, just keep polling
             await asyncio.sleep(delay)
 
     async def _poll_once(self) -> float:
@@ -815,8 +827,15 @@ class App:
             self.pending.discard(bcm)
 
     async def _pulse(self, profile: PinProfile) -> None:
-        await self._send(Op("pulse", pin=profile.bcm, value=PULSE_MS,
-                            req_id=self.client.next_id()))
+        bcm = profile.bcm
+        if bcm in self.pending:      # ignore taps while a pulse is in flight
+            return
+        self.pending.add(bcm)
+        try:
+            await self._send(Op("pulse", pin=bcm, value=PULSE_MS,
+                                req_id=self.client.next_id()))
+        finally:
+            self.pending.discard(bcm)
 
     async def _all_off(self) -> None:
         result = await self._send(
