@@ -21,7 +21,7 @@ class Role(str, Enum):
     OUTPUT = "output"    # LED, relay, buzzer — we drive it
     INPUT = "input"      # button, PIR — we read it
     PWM = "pwm"          # dimmer, motor speed
-    SENSOR = "sensor"    # DHT22, distance, (ADC-backed light)
+    SENSOR = "sensor"    # DHT22, distance, light, CPU temp / system load
     POWER = "power"      # 5V / 3V3 — inert
     GND = "gnd"          # inert
     ID = "id"            # EEPROM — inert
@@ -43,9 +43,14 @@ class FunctionColor(str, Enum):
 class PinProfile:
     """One header position / device. Frozen: contract data, never mutated.
 
-    `physical` is None for devices with no header position (e.g. the
-    ADC-backed light sensor); such devices use sentinel `bcm=-1` so PROFILE
-    stays int-keyed while never matching a real pin.
+    `physical` is None for devices with no header position (ADC-backed light
+    sensor, CPU temp / system load); such devices use a negative sentinel
+    `bcm` (-1, -2, -3, ...) so PROFILE stays int-keyed while never matching
+    a real pin.
+
+    `aux` lists the extra BCM pins a multi-pin device owns (a motor's
+    backward pin, an RGB LED's green/blue). They are claimed on the header
+    map but are NOT standalone devices: no PROFILE entry, no ops on them.
     """
 
     name: str                          # display name: "Status LED", "GPIO17", "5V"
@@ -61,6 +66,8 @@ class PinProfile:
     momentary: bool = False            # press-and-hold output (buzzer) vs latching switch
     pull_up: bool = False              # INPUT: Button(pull_up=...)
     echo: int | None = None            # SENSOR: second BCM pin (HC-SR04 echo)
+    aux: tuple[int, ...] = ()          # extra BCM pins this device owns
+    claimed_by: str = ""               # header-cell only: owning device's name
 
 
 # --------------------------------------------------------------------------
@@ -115,8 +122,7 @@ _STATIC: tuple[tuple[int, str, int | None, FunctionColor, str], ...] = (
 # --------------------------------------------------------------------------
 # Wired devices — the deployable set. Add a pin = append one line here; the
 # GUI card and the pi.py validation pick it up automatically.
-# Placeholders until real wiring is confirmed; avoids I2C (2/3), SPI (7-11),
-# UART (14/15) and EEPROM (0/1) pins.
+# Avoids I2C (2/3), SPI (7-11), UART (14/15) and EEPROM (0/1) pins.
 # --------------------------------------------------------------------------
 WIRED: tuple[PinProfile, ...] = (
     PinProfile(name="Status LED", bcm=17, physical=11, role=Role.OUTPUT, driver="LED"),
@@ -124,8 +130,11 @@ WIRED: tuple[PinProfile, ...] = (
                active_low=True, driver="LED"),
     PinProfile(name="Relay 2", bcm=27, physical=13, role=Role.OUTPUT,
                active_low=True, driver="LED"),
+    # Common-cathode RGB LED: R/G/B on header pins 35/36/37 (BCM 19/16/26).
+    PinProfile(name="RGB LED", bcm=19, physical=35, role=Role.OUTPUT,
+               driver="RGBLED", aux=(16, 26)),
     PinProfile(name="Buzzer", bcm=23, physical=16, role=Role.OUTPUT,
-               momentary=True, driver="Buzzer"),
+               momentary=True, driver="TonalBuzzer"),
     PinProfile(name="Door button", bcm=24, physical=18, role=Role.INPUT,
                pull_up=True, driver="Button"),
     PinProfile(name="PIR sensor", bcm=25, physical=22, role=Role.INPUT,
@@ -134,17 +143,30 @@ WIRED: tuple[PinProfile, ...] = (
                unit="°C", driver="DHT22"),
     PinProfile(name="Distance", bcm=5, physical=29, role=Role.SENSOR,
                unit="m", driver="HCSR04", echo=6),
-    # No header position: lives behind an ADC (MCP3008/ADS1115) that doesn't
-    # exist yet — rendered disabled, reads rejected with a clear fault.
-    # Sentinel bcm=-1 (never a real pin) keeps PROFILE int-keyed so dispatch
-    # can produce the "needs an ADC" error instead of "not in the profile".
+    # LDR behind an MCP3008 ADC on SPI0 (CE0/MOSI/MISO/SCLK = pins 24/19/21/23).
+    # Sentinel bcm=-1 (never a real pin) keeps PROFILE int-keyed so the card
+    # renders while the pin never appears on HEADER (physical is None).
     PinProfile(name="Light (ADC)", bcm=-1, physical=None, role=Role.SENSOR,
-               unit="lx", driver="LDR", needs_adc=True),
+               unit="%", driver="LDR"),
+    # Software sensors on the Pi itself — no GPIO, sentinel bcm -2/-3.
+    PinProfile(name="CPU temp", bcm=-2, physical=None, role=Role.SENSOR,
+               unit="°C", driver="CPUTemperature"),
+    PinProfile(name="System load", bcm=-3, physical=None, role=Role.SENSOR,
+               unit="", driver="LoadAverage"),
     PinProfile(name="Desk dimmer", bcm=18, physical=12, role=Role.PWM,
                unit="%", driver="PWMLED"),
-    PinProfile(name="Motor speed", bcm=13, physical=33, role=Role.PWM,
-               unit="%", driver="PWMLED"),
+    # DC motor on an H-bridge driver (L298N etc.): forward=BCM13, backward=BCM12.
+    # The Pi GPIO cannot source motor current — a driver board is required.
+    PinProfile(name="Motor", bcm=13, physical=33, role=Role.PWM,
+               unit="%", driver="Motor", aux=(12,)),
 )
+
+
+# Friendly labels for aux pins, keyed by driver (length must match aux).
+_AUX_LABELS: dict[str, tuple[str, ...]] = {
+    "Motor": ("back",),
+    "RGBLED": ("G", "B"),
+}
 
 
 def _build_header() -> tuple[PinProfile, ...]:
@@ -176,19 +198,31 @@ def _build_header() -> tuple[PinProfile, ...]:
                 f"{dev.name}: physical pin {dev.physical} is {cell.name}, not BCM {dev.bcm}")
         cells[dev.physical - 1] = dev
 
-    # Secondary pins (HC-SR04 echo) also occupy a header cell, shown claimed.
+    # Secondary pins (HC-SR04 echo; motor backward, RGB green/blue) also
+    # occupy a header cell, shown claimed by their owning device.
     for dev in WIRED:
-        if dev.echo is None:
-            continue
-        if dev.echo in seen_bcm:
-            raise ValueError(f"echo BCM {dev.echo} collides with {seen_bcm[dev.echo]}")
-        echo_cell = next((c for c in cells if c.bcm == dev.echo), None)
-        if echo_cell is None:
-            raise ValueError(f"echo BCM {dev.echo} not found on the 40-pin header")
-        cells[echo_cell.physical - 1] = PinProfile(
-            name=f"{dev.name} (echo)", bcm=dev.echo, physical=echo_cell.physical,
-            role=Role.SENSOR, function=echo_cell.function,
-            alt_function=echo_cell.alt_function, driver=dev.driver)
+        extras: list[tuple[int, str]] = []
+        if dev.echo is not None:
+            extras.append((dev.echo, "echo"))
+        labels = _AUX_LABELS.get(dev.driver, ())
+        if dev.aux and len(labels) != len(dev.aux):
+            raise ValueError(f"{dev.name}: driver {dev.driver} has no aux "
+                             f"labels for {dev.aux}")
+        extras.extend(zip(dev.aux, labels))
+        for pin, label in extras:
+            if pin in seen_bcm:
+                raise ValueError(f"{dev.name} ({label}) BCM {pin} collides "
+                                 f"with {seen_bcm[pin]}")
+            echo_cell = next((c for c in cells if c.bcm == pin), None)
+            if echo_cell is None:
+                raise ValueError(f"{dev.name} ({label}) BCM {pin} not found "
+                                 f"on the 40-pin header")
+            seen_bcm[pin] = dev.name
+            cells[echo_cell.physical - 1] = PinProfile(
+                name=f"{dev.name} ({label})", bcm=pin, physical=echo_cell.physical,
+                role=Role.SENSOR, function=echo_cell.function,
+                alt_function=echo_cell.alt_function, driver=dev.driver,
+                claimed_by=dev.name)
 
     return tuple(cells)
 
@@ -196,9 +230,10 @@ def _build_header() -> tuple[PinProfile, ...]:
 # All 40 header positions, index physical-1. GUI Board strip renders these.
 HEADER: tuple[PinProfile, ...] = _build_header()
 
-# Wired devices keyed by BCM. The ADC light sensor sits under sentinel key -1
-# (not a real pin): reachable from the wire for a clear "needs an ADC" error,
-# never present on HEADER (physical is None). Cards iterate .values().
+# Wired devices keyed by BCM. Sensors without a header position (ADC light,
+# CPU temp, system load) sit under sentinel keys -1/-2/-3 (never real pins):
+# reachable from the wire, never present on HEADER (physical is None).
+# Cards iterate .values().
 PROFILE: dict[int, PinProfile] = {dev.bcm: dev for dev in WIRED}
 
 # Role -> ops pi.py may dispatch. Roles absent from wire traffic (POWER/GND/ID)
@@ -206,9 +241,10 @@ PROFILE: dict[int, PinProfile] = {dev.bcm: dev for dev in WIRED}
 # defined in protocol.py; tests assert every value here is a known wire op.
 ROLE_OPS: dict[Role, frozenset[str]] = {
     Role.FREE: frozenset(),
-    Role.OUTPUT: frozenset({"digital_write", "pulse", "digital_read"}),
+    Role.OUTPUT: frozenset({"digital_write", "pulse", "digital_read",
+                            "rgb_write", "tone"}),
     Role.INPUT: frozenset({"digital_read", "set_input"}),
-    Role.PWM: frozenset({"pwm_write", "digital_read"}),
+    Role.PWM: frozenset({"pwm_write", "digital_read", "motor_write"}),
     Role.SENSOR: frozenset({"read"}),
     Role.POWER: frozenset(),
     Role.GND: frozenset(),

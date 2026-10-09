@@ -29,7 +29,7 @@ import flet as ft
 import pins
 import protocol
 from pins import FunctionColor, PinProfile, Role
-from protocol import Op, OpResult, PinState
+from protocol import Op, OpResult, PinState, ScriptStatus
 
 NARROW_BREAKPOINT = 600          # px: below this we render portrait layout
 POLL_OK_SECONDS = 1.5            # healthy poll cadence
@@ -37,6 +37,25 @@ POLL_FAIL_SECONDS = 3.0          # slower retry while unreachable
 REQUEST_TIMEOUT = 3.0            # per-request urllib timeout
 LOG_LINES = 16                   # activity log depth
 PULSE_MS = 300                   # click-to-pulse duration for the buzzer
+
+# RGB LED preset swatches (avoid the ColorPicker: it needs an extra package).
+_RGB_SWATCHES: tuple[tuple[str, int], ...] = (
+    ("off", 0x000000),
+    ("red", 0xE53935),
+    ("orange", 0xFF9800),
+    ("yellow", 0xFBC02D),
+    ("green", 0x43A047),
+    ("cyan", 0x00BCD4),
+    ("blue", 0x1E88E5),
+    ("purple", 0x8E24AA),
+    ("white", 0xFFFFFF),
+)
+
+# Musical notes for the TonalBuzzer card (all inside its default 220-880 Hz).
+_TONES: tuple[tuple[str, int], ...] = (
+    ("C4", 262), ("D4", 294), ("E4", 330),
+    ("G4", 392), ("A4", 440), ("C5", 523),
+)
 
 # Board strip: intrinsic function-family ring colours (pinout-style palette).
 _FUNCTION_COLORS: dict[FunctionColor, str] = {
@@ -85,10 +104,10 @@ class PiClient:
         self._req_id += 1
         return self._req_id
 
-    def post_op(self, op: Op) -> OpResult:
+    def _post(self, path: str, body: bytes, req_id: int = 0) -> OpResult:
         request = urllib.request.Request(
-            f"{self.base}/op",
-            data=protocol.encode_op(op),
+            f"{self.base}{path}",
+            data=body,
             method="POST",
             headers={"Content-Type": "application/json"},
         )
@@ -101,30 +120,43 @@ class PiClient:
             try:
                 return protocol.parse_result(ex.read())
             except protocol.ProtocolError:
-                return OpResult(ok=False, req_id=op.req_id,
+                return OpResult(ok=False, req_id=req_id,
                                 error=f"HTTP {ex.code}")
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as ex:
             reason = getattr(ex, "reason", ex)
-            return OpResult(ok=False, req_id=op.req_id,
+            return OpResult(ok=False, req_id=req_id,
                             error=f"unreachable: {reason}")
         except Exception as ex:  # client boundary: never crash the GUI loop
-            return OpResult(ok=False, req_id=op.req_id,
+            return OpResult(ok=False, req_id=req_id,
                             error=f"{type(ex).__name__}: {ex}")
 
-    def fetch_state(self) -> tuple[list[PinState] | None, str | None]:
-        """Returns (states, None) on success or (None, reason)."""
+    def post_op(self, op: Op) -> OpResult:
+        return self._post("/op", protocol.encode_op(op), op.req_id)
+
+    def post_script(self, code: str, req_id: int = 0) -> OpResult:
+        return self._post("/script", protocol.encode_script(code, req_id),
+                          req_id)
+
+    def post_script_stop(self, req_id: int = 0) -> OpResult:
+        return self._post("/script/stop", b"{}", req_id)
+
+    def fetch_state(self) -> tuple[list[PinState] | None,
+                                   ScriptStatus | None, str | None]:
+        """Returns (states, script, None) on success or (None, None, reason)."""
         try:
             with urllib.request.urlopen(f"{self.base}/state",
                                         timeout=REQUEST_TIMEOUT) as resp:
-                return protocol.parse_state(resp.read()), None
+                body = resp.read()
+            return (protocol.parse_state(body),
+                    protocol.parse_script_status(body), None)
         except urllib.error.HTTPError as ex:
-            return None, f"HTTP {ex.code}"
+            return None, None, f"HTTP {ex.code}"
         except protocol.ProtocolError as ex:
-            return None, f"bad response: {ex}"
+            return None, None, f"bad response: {ex}"
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as ex:
-            return None, f"unreachable: {getattr(ex, 'reason', ex)}"
+            return None, None, f"unreachable: {getattr(ex, 'reason', ex)}"
         except Exception as ex:  # client boundary: never crash the poll loop
-            return None, f"{type(ex).__name__}: {ex}"
+            return None, None, f"{type(ex).__name__}: {ex}"
 
 
 def _badge_for_state(state: PinState) -> tuple[str, str, str]:
@@ -155,6 +187,8 @@ class App:
         self.error: str | None = None
         self.latency_ms: float | None = None
         self.states: dict[int, PinState] = {}
+        self.script: ScriptStatus | None = None
+        self.script_code: str = ""            # survives re-renders
         self.pending: set[int] = set()      # BCMs with an op in flight
         self.board_open = True
         self.log: list[tuple[str, bool]] = []
@@ -174,6 +208,11 @@ class App:
         self.sensor_notes: dict[int, ft.Text] = {}
         self.cell_bgs: dict[int, ft.Container] = {}
         self.cell_badges: dict[int, ft.Text] = {}
+        self.script_field: ft.TextField | None = None
+        self.script_run: ft.Button | None = None
+        self.script_stop: ft.Button | None = None
+        self.script_status: ft.Text | None = None
+        self.script_output: ft.Text | None = None
 
     # ------------------------------------------------------------ lifecycle --
 
@@ -217,6 +256,8 @@ class App:
         # pending, its on_change_end will never arrive, so drop the marks
         # rather than leaving that BCM stuck (polls would skip it forever).
         self.pending.clear()
+        if self.script_field is not None and self.script_field.value is not None:
+            self.script_code = self.script_field.value  # keep the typed script
         self.toggles.clear()
         self.switches.clear()
         self.sliders.clear()
@@ -237,6 +278,7 @@ class App:
                 self._inputs_section(),
                 self._sensors_section(),
                 self._pwm_section(),
+                self._script_section(),
                 self._log_section(),
             ],
             spacing=14,
@@ -329,7 +371,7 @@ class App:
     async def _poll_once(self) -> float:
         was_connected = self.connected
         t0 = time.monotonic()
-        states, error = await asyncio.to_thread(self.client.fetch_state)
+        states, script, error = await asyncio.to_thread(self.client.fetch_state)
         elapsed_ms = (time.monotonic() - t0) * 1000.0
 
         if error is not None:
@@ -342,6 +384,8 @@ class App:
             return POLL_FAIL_SECONDS
 
         self.states = {s.bcm: s for s in states}
+        self._note_script_transition(script)
+        self.script = script
         self.connected = True
         self.error = None
         self.latency_ms = elapsed_ms
@@ -351,8 +395,24 @@ class App:
                 f"({elapsed_ms:.0f} ms)", True)
         self._apply_states()
         self._apply_connection()
+        self._apply_script()
         self.page.update()
         return POLL_OK_SECONDS
+
+    def _note_script_transition(self, script: ScriptStatus | None) -> None:
+        """Log script start/exit edges once, as they arrive via polling."""
+        old, self.script = self.script, script
+        if script is None or old is None:
+            return
+        if script.job != old.job and script.job:
+            self._push_log(f"script job {script.job} started", True)
+        elif script.running != old.running:
+            if script.running:
+                self._push_log(f"script job {script.job} started", True)
+            elif script.exit is not None:
+                self._push_log(
+                    f"script job {script.job} exited with {script.exit}",
+                    script.exit == 0)
 
     # ------------------------------------------------------------ logging ----
 
@@ -383,6 +443,16 @@ class App:
         return result
 
     # ------------------------------------------------------------- states ----
+
+    @staticmethod
+    def _sensor_pin_note(profile: PinProfile) -> str:
+        """Where a sensor lives: GPIO pins, the ADC bus, or 'on the Pi'."""
+        if profile.physical is None:
+            return "MCP3008 · SPI0" if profile.driver == "LDR" else "on the Pi"
+        text = f"GPIO{profile.bcm}"
+        if profile.echo is not None:
+            text += f" + GPIO{profile.echo}"
+        return text
 
     def _apply_states(self) -> None:
         for bcm, state in self.states.items():
@@ -415,10 +485,7 @@ class App:
                 else:
                     value_text.value = f"{state.value}{state.unit}"
                     if note is not None:
-                        pins_ = f"GPIO{bcm}"
-                        if profile.echo is not None:
-                            pins_ += f" + GPIO{profile.echo}"
-                        note.value = pins_
+                        note.value = self._sensor_pin_note(profile)
                         note.color = "#78909C"
 
             slider = self.sliders.get(bcm)
@@ -493,11 +560,14 @@ class App:
                 lambda e, p=profile: self._on_switch(p, e))
             self.switches[profile.bcm] = switch
             self.toggles.append(switch)
-            cards.append(self._card(
+            rows = [
                 ft.Text(f"GPIO{profile.bcm} · {profile.driver}",
                         size=11, color=_CARD_SUB),
                 switch,
-            ))
+            ]
+            if profile.driver == "RGBLED":
+                rows.append(self._rgb_swatches(profile))
+            cards.append(self._card(*rows))
         off_button = ft.Button(
             content="ALL OFF", key="all-off", bgcolor="#E53935",
             color="#FFFFFF",
@@ -506,6 +576,45 @@ class App:
         self.toggles.append(off_button)
         return self._section("Outputs", "switches · relay is active-low",
                              cards, off_button)
+
+    def _rgb_swatches(self, profile: PinProfile) -> ft.Row:
+        """Preset colour buttons — set the LED in one tap (0xRRGGBB)."""
+        swatches = ft.Row(
+            controls=[
+                ft.Button(
+                    content=ft.Container(
+                        width=26, height=26, border_radius=6,
+                        bgcolor=f"#{packed:06X}",
+                        border=ft.Border.all(1, "#B0BEC5")),
+                    tooltip=name,
+                    key=f"rgb-{profile.bcm}-{name}",
+                    disabled=not self.connected,
+                    on_click=lambda e, p=profile, c=packed: (
+                        self.page.run_task(self._write_rgb, p, c)),
+                )
+                for name, packed in _RGB_SWATCHES
+            ],
+            wrap=True, spacing=6, run_spacing=6,
+        )
+        self.toggles.extend(swatches.controls)
+        return swatches
+
+    async def _write_rgb(self, profile: PinProfile, packed: int) -> None:
+        bcm = profile.bcm
+        if bcm in self.pending:
+            return
+        self.pending.add(bcm)
+        try:
+            result = await self._send(Op(
+                "rgb_write", pin=bcm, value=packed,
+                req_id=self.client.next_id()))
+            sw = self.switches.get(bcm)
+            if sw is not None:
+                if result.ok:
+                    sw.value = packed != 0
+                self.page.update()
+        finally:
+            self.pending.discard(bcm)
 
     def _momentary_section(self) -> ft.Column:
         cards = []
@@ -519,14 +628,43 @@ class App:
                     self._pulse, p),
             )
             self.toggles.append(button)
-            cards.append(self._card(
+            rows = [
                 ft.Text(profile.name, size=13, weight=ft.FontWeight.BOLD,
                         color=_CARD_TEXT),
                 ft.Text(f"GPIO{profile.bcm} · tap to pulse",
                         size=11, color=_CARD_SUB),
                 button,
-            ))
+            ]
+            if profile.driver == "TonalBuzzer":
+                rows.append(ft.Text("notes", size=11, color=_CARD_SUB))
+                notes = ft.Row(
+                    controls=[
+                        ft.Button(
+                            content=f"{note} {hz}",
+                            key=f"tone-{profile.bcm}-{hz}",
+                            disabled=not self.connected,
+                            on_click=lambda e, p=profile, f=hz: (
+                                self.page.run_task(self._tone, p, f)),
+                        )
+                        for note, hz in _TONES
+                    ],
+                    wrap=True, spacing=6, run_spacing=6,
+                )
+                self.toggles.extend(notes.controls)
+                rows.append(notes)
+            cards.append(self._card(*rows))
         return self._section("Momentary", "tap = one pulse", cards)
+
+    async def _tone(self, profile: PinProfile, hz: int) -> None:
+        bcm = profile.bcm
+        if bcm in self.pending:
+            return
+        self.pending.add(bcm)
+        try:
+            await self._send(Op("tone", pin=bcm, value=hz,
+                                req_id=self.client.next_id()))
+        finally:
+            self.pending.discard(bcm)
 
     def _inputs_section(self) -> ft.Column:
         cards = []
@@ -561,14 +699,10 @@ class App:
             state = self.states.get(profile.bcm)
             value = ft.Text("—", size=22, weight=ft.FontWeight.BOLD,
                             color=_CARD_TEXT)
+            note = ft.Text(self._sensor_pin_note(profile), size=11,
+                           color="#E53935" if profile.needs_adc else _CARD_SUB)
             if profile.needs_adc:
-                note = ft.Text("needs an ADC (not fitted)", size=11,
-                               color="#E53935")
-            else:
-                pins_ = f"GPIO{profile.bcm}"
-                if profile.echo is not None:
-                    pins_ += f" + GPIO{profile.echo}"
-                note = ft.Text(pins_, size=11, color=_CARD_SUB)
+                note.value = "needs an ADC (not fitted)"
             self.sensor_values[profile.bcm] = value
             self.sensor_notes[profile.bcm] = note
             cards.append(self._card(
@@ -587,10 +721,13 @@ class App:
                 continue
             state = self.states.get(profile.bcm)
             pct = float(state.value) if state and state.value else 0.0
+            # A motor slider spans reverse..stop..forward; a dimmer 0..100.
+            is_motor = profile.driver == "Motor"
+            low, high = (-100.0, 100.0) if is_motor else (0.0, 100.0)
             label = ft.Text(f"{pct:.0f}%", size=13,
                             weight=ft.FontWeight.BOLD, color=_ACCENT)
             slider = ft.Slider(
-                value=pct, min=0, max=100, divisions=20,
+                value=pct, min=low, max=high, divisions=40 if is_motor else 20,
                 label="{value}%", key=f"slider-{profile.bcm}",
                 disabled=not self.connected,
                 on_change_start=lambda e, p=profile: self.pending.add(p.bcm),
@@ -601,17 +738,143 @@ class App:
             self.sliders[profile.bcm] = slider
             self.slider_labels[profile.bcm] = label
             self.toggles.append(slider)
+            if is_motor:
+                hint = (f"GPIO{profile.bcm} fwd · GPIO{profile.aux[0]} back"
+                        if profile.aux else f"GPIO{profile.bcm}")
+            else:
+                hint = f"GPIO{profile.bcm} · {profile.driver}"
             cards.append(self._card(
                 ft.Row(controls=[
                     ft.Text(profile.name, size=13,
                             weight=ft.FontWeight.BOLD, color=_CARD_TEXT),
                     label,
                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                ft.Text(f"GPIO{profile.bcm} · {profile.driver}",
-                        size=11, color=_CARD_SUB),
+                ft.Text(hint, size=11, color=_CARD_SUB),
                 slider,
             ))
         return self._section("PWM", "duty cycle · send on release", cards)
+
+    def _script_section(self) -> ft.Column:
+        """Run a Python script on the Pi (opt-in: pi.py --allow-code)."""
+        script = self.script
+        enabled = bool(script and script.enabled)
+        running = bool(script and script.running)
+        if script is None or not script.enabled:
+            status_text, status_color = "requires pi.py --allow-code", "#E53935"
+        elif running:
+            status_text, status_color = f"running (job {script.job})", "#F57F17"
+        elif script.job:
+            status_text, status_color = (
+                f"job {script.job} finished · exit {script.exit}",
+                "#43A047" if script.exit == 0 else "#E53935")
+        else:
+            status_text, status_color = "idle", "#78909C"
+
+        self.script_field = ft.TextField(
+            value=self.script_code,
+            multiline=True, min_lines=4, max_lines=10,
+            label="Python script (runs on the Pi)",
+            hint_text="import time; print('hello from the Pi')",
+            text_style=ft.TextStyle(font_family="monospace", size=12),
+            key="script-code",
+            # Always editable — you can compose while offline or while a job
+            # runs; only Run/Stop are gated by connection + --allow-code.
+        )
+        self.script_field.on_change = self._on_script_edit
+        self.script_run = ft.Button(
+            content="Run on Pi", key="script-run", bgcolor="#43A047",
+            color="#FFFFFF",
+            disabled=not (self.connected and enabled and not running),
+            on_click=lambda e: self.page.run_task(self._run_script),
+        )
+        self.script_stop = ft.Button(
+            content="Stop", key="script-stop", bgcolor="#E53935",
+            color="#FFFFFF",
+            disabled=not (self.connected and running),
+            on_click=lambda e: self.page.run_task(self._stop_script),
+        )
+        self.script_status = ft.Text(status_text, size=12,
+                                     color=status_color)
+        self.script_output = ft.Text(
+            script.output if script and script.output else "",
+            size=11, selectable=True,
+            font_family="monospace", color=_CARD_TEXT,
+            max_lines=12, overflow=ft.TextOverflow.VISIBLE,
+        )
+        return ft.Column(
+            controls=[
+                ft.Row(
+                    controls=[
+                        ft.Text("Script", size=15,
+                                weight=ft.FontWeight.BOLD),
+                        ft.Text("subprocess on the Pi · stdout+stderr",
+                                size=11, color="#90A4AE"),
+                        self.script_status,
+                    ],
+                    wrap=True, spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                self.script_field,
+                ft.Row(controls=[self.script_run, self.script_stop],
+                       spacing=8),
+                self.script_output,
+            ],
+            spacing=8,
+        )
+
+    def _on_script_edit(self, e: ft.ControlEvent) -> None:
+        self.script_code = e.control.value or ""
+
+    async def _run_script(self) -> None:
+        code = self.script_code
+        if not code.strip():
+            self._push_log("script: nothing to run", False)
+            self.page.update()
+            return
+        result = await asyncio.to_thread(
+            self.client.post_script, code, self.client.next_id())
+        self._push_log(
+            f"script: " + ("started" if result.ok else f"ERR {result.error}"),
+            result.ok)
+        self.page.update()
+        self.page.run_task(self._poll_once)
+
+    async def _stop_script(self) -> None:
+        result = await asyncio.to_thread(
+            self.client.post_script_stop, self.client.next_id())
+        self._push_log(
+            "script stop: " + ("ok" if result.ok else f"ERR {result.error}"),
+            result.ok)
+        self.page.update()
+        self.page.run_task(self._poll_once)
+
+    def _apply_script(self) -> None:
+        """Refresh Run/Stop/status/output from the latest polled status."""
+        script = self.script
+        enabled = bool(script and script.enabled)
+        running = bool(script and script.running)
+        if self.script_run is not None:
+            self.script_run.disabled = not (
+                self.connected and enabled and not running)
+        if self.script_stop is not None:
+            self.script_stop.disabled = not (self.connected and running)
+        if self.script_status is not None and script is not None:
+            if not script.enabled:
+                self.script_status.value = "requires pi.py --allow-code"
+                self.script_status.color = "#E53935"
+            elif running:
+                self.script_status.value = f"running (job {script.job})"
+                self.script_status.color = "#F57F17"
+            elif script.job:
+                self.script_status.value = (
+                    f"job {script.job} finished · exit {script.exit}")
+                self.script_status.color = (
+                    "#43A047" if script.exit == 0 else "#E53935")
+            else:
+                self.script_status.value = "idle"
+                self.script_status.color = "#78909C"
+        if self.script_output is not None and script is not None:
+            self.script_output.value = script.output or ""
 
     def _log_section(self) -> ft.Column:
         self.log_column = ft.Column(controls=self._log_texts(), spacing=2)
@@ -864,8 +1127,10 @@ class App:
                           e: ft.ControlEvent) -> None:
         try:
             pct = float(e.control.value)
+            op = ("motor_write" if profile.driver == "Motor"
+                  else "pwm_write")
             result = await self._send(Op(
-                "pwm_write", pin=profile.bcm, value=pct,
+                op, pin=profile.bcm, value=pct,
                 req_id=self.client.next_id()))
             if not result.ok:
                 # revert to the last state the Pi reported

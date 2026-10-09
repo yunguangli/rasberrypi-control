@@ -8,7 +8,10 @@ Deployment note: part of the 3-file copy set for the Pi.
 Wire shape (HTTP + JSON, see plan.md §4):
   POST /op    {"op":"digital_write","pin":17,"value":1,"req_id":42}
               -> 200 {"ok":true,"req_id":42,...}  or  400 {"ok":false,"error":...}
-  GET /state  -> 200 {"ok":true,"pins":[PinState,...]}
+  GET /state  -> 200 {"ok":true,"pins":[PinState,...],"script":{...}?}
+  POST /script      {"script":"print(1)","req_id":7}   (only with --allow-code)
+              -> 200 {"ok":true,"value":<job>}  or  400 {"ok":false,"error":...}
+  POST /script/stop -> 200 {"ok":true}  or  400 {"ok":false,"error":...}
 """
 
 from __future__ import annotations
@@ -27,10 +30,12 @@ SYSTEM_OPS = frozenset({"noop", "all_off"})
 KNOWN_OPS = SYSTEM_OPS | frozenset({
     "digital_write", "digital_read", "pwm_write",
     "pulse", "read", "set_input",
+    "motor_write", "rgb_write", "tone",
 })
 
-MAX_BODY = 4096        # request bodies are tiny; refuse anything larger
-MAX_ABS_VALUE = 1_000_000
+MAX_BODY = 4096        # op request bodies are tiny; refuse anything larger
+MAX_SCRIPT_BODY = 65536  # /script bodies carry a whole program, not one op
+MAX_ABS_VALUE = 16_777_215  # covers duty %, Hz, and a packed 0xRRGGBB colour
 
 
 class ProtocolError(ValueError):
@@ -68,6 +73,17 @@ class PinState:
     fault: str = ""                   # device error surfaced to the card
 
 
+@dataclass(frozen=True)
+class ScriptStatus:
+    """State of the GUI-submitted script job, piggybacked on GET /state."""
+
+    enabled: bool = False       # bridge was started with --allow-code
+    running: bool = False       # a script job is executing right now
+    job: int = 0                # job counter; 0 = nothing submitted yet
+    exit: int | None = None     # exit code of the last finished job
+    output: str = ""            # captured stdout+stderr (tail)
+
+
 # ---------------------------------------------------------------- encode ----
 
 def encode_op(op: Op) -> bytes:
@@ -88,10 +104,17 @@ def encode_result(res: OpResult) -> bytes:
     return json.dumps(body, separators=(",", ":")).encode("utf-8")
 
 
-def encode_state(states: list[PinState]) -> bytes:
+def encode_state(states: list[PinState],
+                 script: ScriptStatus | None = None) -> bytes:
+    body: dict = {"ok": True, "pins": [s.__dict__ for s in states]}
+    if script is not None:
+        body["script"] = script.__dict__
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+
+def encode_script(code: str, req_id: int = 0) -> bytes:
     return json.dumps(
-        {"ok": True, "pins": [s.__dict__ for s in states]},
-        separators=(",", ":"),
+        {"script": code, "req_id": req_id}, separators=(",", ":"),
     ).encode("utf-8")
 
 
@@ -181,3 +204,53 @@ def parse_state(body: bytes) -> list[PinState]:
             fault=str(row.get("fault", "")),
         ))
     return states
+
+
+# ------------------------------------------------------------- script -------
+
+def parse_script(body: bytes) -> tuple[str, int]:
+    """Parse a POST /script body -> (code, req_id); raise ProtocolError."""
+    if len(body) > MAX_SCRIPT_BODY + 256:
+        raise ProtocolError(f"script body exceeds {MAX_SCRIPT_BODY} bytes")
+    try:
+        raw = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as ex:
+        raise ProtocolError(f"malformed JSON: {ex}") from ex
+    if not isinstance(raw, dict):
+        raise ProtocolError("body must be a JSON object")
+    code = raw.get("script")
+    if not isinstance(code, str) or not code.strip():
+        raise ProtocolError("'script' must be a non-empty string")
+    if len(code.encode("utf-8")) > MAX_SCRIPT_BODY:
+        raise ProtocolError(f"script exceeds {MAX_SCRIPT_BODY} bytes")
+    return code, _require_int(raw, "req_id", 0)
+
+
+def parse_script_status(body: bytes) -> ScriptStatus:
+    """Parse the optional 'script' object from a GET /state body.
+
+    Tolerant by design: any missing/garbled block becomes the default
+    (disabled, not running) so an old bridge or a truncated reply degrades
+    the GUI gracefully instead of failing the whole poll.
+    """
+    try:
+        raw = json.loads(body.decode("utf-8"))
+        if not isinstance(raw, dict):
+            return ScriptStatus()
+        s = raw.get("script")
+        if not isinstance(s, dict):
+            return ScriptStatus()
+        exit_code = s.get("exit")
+        if exit_code is not None and (isinstance(exit_code, bool)
+                                      or not isinstance(exit_code, int)):
+            exit_code = None
+        return ScriptStatus(
+            enabled=bool(s.get("enabled", False)),
+            running=bool(s.get("running", False)),
+            job=int(s.get("job", 0)) if isinstance(s.get("job", 0), int)
+            else 0,
+            exit=exit_code,
+            output=str(s.get("output", "")),
+        )
+    except Exception:  # noqa: BLE001 — deliberately total
+        return ScriptStatus()

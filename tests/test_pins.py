@@ -64,9 +64,52 @@ def test_wired_bcms_are_unique_and_on_header():
 
 def test_light_sensor_has_no_header_position():
     light = pins.PROFILE[-1]
-    assert light.needs_adc is True
+    assert light.needs_adc is False      # MCP3008 on SPI0 now provides the pin
+    assert light.unit == "%" and light.driver == "LDR"
     assert light.bcm == -1 and light.physical is None
     assert all(c is not light for c in pins.HEADER)
+
+
+def test_system_sensors_use_negative_sentinels():
+    """CPU temp / system load have no GPIO — sentinel keys keep PROFILE keyed."""
+    cpu, load = pins.PROFILE[-2], pins.PROFILE[-3]
+    assert cpu.driver == "CPUTemperature" and cpu.unit == "°C"
+    assert load.driver == "LoadAverage"
+    for dev in (cpu, load):
+        assert dev.physical is None
+        assert all(c is not dev for c in pins.HEADER)
+
+
+def test_motor_is_signed_pwm_with_aux_backward_pin():
+    motor = pins.PROFILE[13]
+    assert motor.driver == "Motor" and motor.role is Role.PWM
+    assert motor.aux == (12,)
+    back = pins.HEADER[32 - 1]  # BCM 12 -> physical 32
+    assert back.bcm == 12 and back.claimed_by == "Motor" and "(back)" in back.name
+
+
+def test_rgb_led_owns_two_aux_pins():
+    rgb = pins.PROFILE[19]
+    assert rgb.driver == "RGBLED" and rgb.aux == (16, 26)
+    green, blue = pins.HEADER[36 - 1], pins.HEADER[37 - 1]
+    assert green.bcm == 16 and green.claimed_by == "RGB LED"
+    assert blue.bcm == 26 and blue.claimed_by == "RGB LED"
+    # aux pins are NOT standalone devices: no PROFILE entry, no ops
+    for pin in (12, 16, 26):
+        assert pin not in pins.PROFILE
+
+
+def test_buzzer_is_tonal():
+    buzzer = pins.PROFILE[23]
+    assert buzzer.driver == "TonalBuzzer" and buzzer.momentary is True
+
+
+def test_every_aux_pin_has_labels():
+    """_AUX_LABELS must cover every driver that uses aux pins."""
+    for dev in pins.WIRED:
+        if dev.aux:
+            labels = pins._AUX_LABELS.get(dev.driver)
+            assert labels and len(labels) == len(dev.aux), dev.name
 
 
 def test_echo_pin_is_claimed_on_header():

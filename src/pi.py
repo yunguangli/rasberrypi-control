@@ -11,6 +11,7 @@ only if the user installed it — gpiozero has no DHT22 class (issue #254).
 Run on the Pi:
     pip install gpiozero              # or: apt install python3-gpiozero
     python3 pi.py --port 8642
+    python3 pi.py --allow-code        # additionally let the GUI run scripts
 
 Run on the PC (development: mock pins + synthetic sensor values):
     uv run python src/pi.py --dev
@@ -24,11 +25,13 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import subprocess
 import sys
 import threading
 import time
 import traceback
 import warnings
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import gpiozero
@@ -51,7 +54,13 @@ _DIRECTION = {
 _SYNTHETIC = {
     "DHT22": lambda t: round(21.0 + 2.0 * math.sin(t / 60.0), 1),
     "HCSR04": lambda t: round(0.6 + 0.4 * math.sin(t / 15.0), 2),
+    "LDR": lambda t: round(50.0 + 25.0 * math.sin(t / 45.0), 1),          # % bright
+    "CPUTemperature": lambda t: round(48.0 + 6.0 * math.sin(t / 120.0), 1),
+    "LoadAverage": lambda t: round(0.6 + 0.5 * math.sin(t / 30.0), 2),
 }
+
+# A tone op plays for this long, then stops — like pulse, but musical.
+TONE_MS = 400
 
 # A device that failed to construct is not retried on every poll; it is
 # retried after this many seconds (unplugging/replugging a sensor recovers
@@ -142,6 +151,10 @@ class Dispatcher:
         self._ctor_lock = threading.Lock()
         self._sensor_lock = threading.Lock()  # non-gpiozero sensor reads
         self._started = time.monotonic()
+        # Set while a GUI-submitted script job owns the GPIO: every pin op
+        # (except noop/all_off) is refused with a clear error.
+        self.halted = False
+        self.script: "ScriptRunner | None" = None
 
     # ------------------------------------------------------------- devices --
 
@@ -178,17 +191,49 @@ class Dispatcher:
             self._failed.pop(bcm, None)
         return dev
 
+    def release_all(self) -> int:
+        """Close every constructed device and clear caches.
+
+        Called before a script job starts: gpiozero can't share a pin across
+        processes, so the bridge must let go of the GPIO before the child
+        process claims it. Devices are rebuilt lazily on the next op.
+        """
+        with self._ctor_lock:
+            devices = list(self._devices.values())
+            self._devices.clear()
+            self._failed.clear()
+        closed = 0
+        for dev in devices:
+            try:
+                dev.close()
+                closed += 1
+            except Exception:  # noqa: BLE001 — best effort; never block the script
+                pass
+        return closed
+
     def _create(self, profile: PinProfile):
         drv, role, bcm = profile.driver, profile.role, profile.bcm
         if role is Role.OUTPUT:
             if drv == "Buzzer":
                 return gpiozero.Buzzer(bcm)
+            if drv == "TonalBuzzer":
+                return gpiozero.TonalBuzzer(bcm)
+            if drv == "RGBLED":
+                if len(profile.aux) != 2:
+                    raise RuntimeError(
+                        f"{profile.name}: RGBLED needs aux=(green, blue) pins")
+                return gpiozero.RGBLED(red=bcm, green=profile.aux[0],
+                                       blue=profile.aux[1])
             return gpiozero.LED(bcm, active_high=not profile.active_low)
         if role is Role.INPUT:
             if drv == "MotionSensor":
                 return gpiozero.MotionSensor(bcm)
             return gpiozero.Button(bcm, pull_up=profile.pull_up)
         if role is Role.PWM:
+            if drv == "Motor":
+                if not profile.aux:
+                    raise RuntimeError(f"{profile.name}: Motor needs an aux (backward) pin")
+                return gpiozero.Motor(forward=bcm, backward=profile.aux[0])
             return gpiozero.PWMLED(bcm)
         if role is Role.SENSOR:
             if drv == "DHT22":
@@ -199,6 +244,14 @@ class Dispatcher:
                 # GET /state forever and leak a thread per poll.
                 return gpiozero.DistanceSensor(trigger=bcm, echo=profile.echo,
                                                partial=True)
+            if drv == "LDR":
+                # gpiozero's LightSensor takes an analog pin; the MCP3008 on
+                # SPI0 (CE0) provides it. Needs spidev + SPI enabled.
+                return gpiozero.LightSensor(gpiozero.MCP3008(channel=0))
+            if drv == "CPUTemperature":
+                return gpiozero.CPUTemperature()
+            if drv == "LoadAverage":
+                return gpiozero.LoadAverage(minutes=1)
         raise RuntimeError(f"cannot build a device for {profile.name} ({drv}/{role})")
 
     # ------------------------------------------------------------- sensors --
@@ -223,6 +276,13 @@ class Dispatcher:
             return float(value)
         if profile.driver == "HCSR04":
             return float(dev.distance)
+        if profile.driver == "LDR":
+            # LightSensor.value: 0 (dark) .. 1 (bright) — report as % bright.
+            return round(float(dev.value) * 100.0, 1)
+        if profile.driver == "CPUTemperature":
+            return round(float(dev.temperature), 1)
+        if profile.driver == "LoadAverage":
+            return float(dev.load_average)
         raise RuntimeError(f"unknown sensor driver {profile.driver!r}")
 
     # ------------------------------------------------------------ execution --
@@ -246,7 +306,15 @@ class Dispatcher:
         if op.op == "noop":
             return OpResult(ok=True, req_id=req)
         if op.op == "all_off":
+            # A script job may own the GPIO right now — silence it first so
+            # all_off always means "make everything quiet", including the
+            # subprocess's pins.
+            if self.script is not None:
+                self.script.stop()
             return OpResult(ok=True, req_id=req, value=self.all_off())
+        if self.halted:
+            return OpResult(ok=False, req_id=req,
+                            error="script is running — stop it first")
 
         profile = pins.PROFILE.get(op.pin)
         if profile is None:
@@ -270,7 +338,11 @@ class Dispatcher:
                 return OpResult(ok=False, req_id=req,
                                 error="value must be true/false or 1/0")
             dev = self._device(profile)
-            dev.on() if level else dev.off()
+            if profile.driver == "TonalBuzzer":
+                # TonalBuzzer has no on/off — a "high" is a 440 Hz tone.
+                dev.play(440.0) if level else dev.stop()
+            else:
+                dev.on() if level else dev.off()
             return OpResult(ok=True, req_id=req, value=bool(level))
 
         if op.op == "pwm_write":
@@ -294,12 +366,74 @@ class Dispatcher:
                 return OpResult(ok=False, req_id=req,
                                 error="pulse duration must be 1..10000 ms")
             dev = self._device(profile)
-            dev.on()
+            if profile.driver == "TonalBuzzer":
+                dev.play(440.0)
+            else:
+                dev.on()
             try:
                 time.sleep(duration_ms / 1000.0)
             finally:
-                dev.off()  # always leave the pin quiet, even on interrupt
+                # always leave the pin quiet, even on interrupt
+                (dev.stop() if profile.driver == "TonalBuzzer" else dev.off())
             return OpResult(ok=True, req_id=req, value=float(duration_ms))
+
+        if op.op == "motor_write":
+            value = op.value
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return OpResult(ok=False, req_id=req,
+                                error="value must be a number -100..100")
+            if not -100 <= value <= 100:
+                return OpResult(ok=False, req_id=req,
+                                error="motor value must be -100..100")
+            if profile.driver != "Motor":
+                return OpResult(ok=False, req_id=req,
+                                error=f"{profile.name} is not a motor")
+            dev = self._device(profile)
+            dev.value = float(value) / 100.0   # gpiozero: -1..1 signed speed
+            return OpResult(ok=True, req_id=req, value=float(value))
+
+        if op.op == "rgb_write":
+            value = op.value
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or int(value) != value:
+                return OpResult(ok=False, req_id=req,
+                                error="value must be an int 0..16777215 (0xRRGGBB)")
+            value = int(value)
+            if not 0 <= value <= 0xFFFFFF:
+                return OpResult(ok=False, req_id=req,
+                                error="colour must be 0..16777215 (0xRRGGBB)")
+            if profile.driver != "RGBLED":
+                return OpResult(ok=False, req_id=req,
+                                error=f"{profile.name} is not an RGB LED")
+            dev = self._device(profile)
+            dev.value = (
+                ((value >> 16) & 0xFF) / 255.0,
+                ((value >> 8) & 0xFF) / 255.0,
+                (value & 0xFF) / 255.0,
+            )
+            return OpResult(ok=True, req_id=req, value=value)
+
+        if op.op == "tone":
+            value = op.value
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return OpResult(ok=False, req_id=req,
+                                error="value must be a frequency in Hz (200..5000)")
+            if not 200 <= value <= 5000:
+                return OpResult(ok=False, req_id=req,
+                                error="frequency must be 200..5000 Hz")
+            if profile.driver != "TonalBuzzer":
+                return OpResult(ok=False, req_id=req,
+                                error=f"{profile.name} is not a buzzer")
+            dev = self._device(profile)
+            try:
+                dev.play(float(value))
+            except ValueError as ex:  # outside this buzzer's tone range
+                return OpResult(ok=False, req_id=req, error=f"tone: {ex}")
+            try:
+                time.sleep(TONE_MS / 1000.0)
+            finally:
+                dev.stop()
+            return OpResult(ok=True, req_id=req, value=float(value))
 
         if op.op == "digital_read":
             dev = self._device(profile)
@@ -332,6 +466,8 @@ class Dispatcher:
                 dev = self._device(profile)
                 if profile.role is Role.PWM:
                     dev.value = 0.0
+                elif profile.driver == "TonalBuzzer":
+                    dev.stop()   # no off() on TonalBuzzer
                 else:
                     dev.off()
                 off += 1
@@ -345,7 +481,16 @@ class Dispatcher:
 
     def state(self) -> list[PinState]:
         """One row per wired device — a single GET refreshes the whole GUI."""
+        if self.halted:
+            return [self._halted_row(p) for p in pins.PROFILE.values()]
         return [self._state_row(p) for p in pins.PROFILE.values()]
+
+    @staticmethod
+    def _halted_row(profile: PinProfile) -> PinState:
+        return PinState(bcm=profile.bcm,
+                        direction=_DIRECTION.get(profile.role, "out"),
+                        unit=profile.unit,
+                        fault="script running (GPIO released)")
 
     def _state_row(self, profile: PinProfile) -> PinState:
         direction = _DIRECTION.get(profile.role, "out")
@@ -358,9 +503,20 @@ class Dispatcher:
                                 value=self._read_sensor(profile), unit=profile.unit)
             dev = self._device(profile)
             if profile.role is Role.PWM:
-                value: float | bool = round(dev.value * 100.0, 1)
+                # PWMLED: 0..100; Motor: signed -100..100 (value is -1..1).
+                value: float | int | bool = round(dev.value * 100.0, 1)
                 return PinState(bcm=profile.bcm, direction=direction, value=value,
                                 unit="%")
+            if profile.driver == "TonalBuzzer":
+                # value is None when silent, else a float that is 0.0 at the
+                # mid tone — so test for None, not truthiness.
+                return PinState(bcm=profile.bcm, direction=direction,
+                                value=dev.value is not None)
+            if profile.driver == "RGBLED":
+                # packed 0xRRGGBB: truthy for any non-black colour, 0 = off.
+                r, g, b = (round(c * 255) for c in dev.value)
+                return PinState(bcm=profile.bcm, direction=direction,
+                                value=(r << 16) | (g << 8) | b)
             return PinState(bcm=profile.bcm, direction=direction,
                             value=bool(dev.value))
         except Exception as ex:  # noqa: BLE001 — surface on the card, keep serving
@@ -368,10 +524,123 @@ class Dispatcher:
                             fault=f"{type(ex).__name__}: {ex}")
 
 
+class ScriptRunner:
+    """Runs GUI-submitted scripts as subprocess jobs (opt-in via --allow-code).
+
+    A script is a whole Python program typed into the GUI and run as a child
+    process (`python -c code`) on the Pi. Safety model for a home/school lab:
+
+    - Off by default: pi.py must be started with --allow-code.
+    - One job at a time; starting one releases every GPIO device first
+      (gpiozero can't share pins across processes) and halts pin ops.
+    - Stop = SIGTERM (then SIGKILL after 2 s) — the GUI's panic button.
+    - stdout+stderr are merged into a bounded tail the GUI can display.
+    """
+
+    OUTPUT_TAIL_LINES = 200   # keep the last N lines for GET /state
+
+    def __init__(self, dispatcher: Dispatcher, *, enabled: bool = False,
+                 echo_code: bool = False) -> None:
+        self.dispatcher = dispatcher
+        self.enabled = enabled
+        self.echo_code = echo_code  # --dev + --allow-code: print the source
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._running = False      # cleared only by the reader's finalization
+        self._job = 0
+        self._exit: int | None = None
+        self._lines: deque[str] = deque(maxlen=self.OUTPUT_TAIL_LINES)
+
+    def start(self, code: str, req_id: int = 0) -> OpResult:
+        if not self.enabled:
+            return OpResult(ok=False, req_id=req_id,
+                            error="code execution disabled — start pi.py with --allow-code")
+        with self._lock:
+            if self._running:
+                return OpResult(ok=False, req_id=req_id,
+                                error=f"job {self._job} is still running — stop it first")
+            released = self.dispatcher.release_all()
+            self.dispatcher.halted = True
+            self._job += 1
+            job = self._job
+            self._exit = None
+            self._lines.clear()
+            try:
+                self._proc = subprocess.Popen(
+                    [sys.executable, "-c", code],
+                    stdin=subprocess.DEVNULL,      # never block on input()
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,      # merge: one output stream
+                    text=True, encoding="utf-8", errors="replace",
+                    env=os.environ.copy(),         # inherits mock-pin vars in --dev
+                )
+            except OSError as ex:
+                self._proc = None
+                self._running = False
+                self.dispatcher.halted = False
+                return OpResult(ok=False, req_id=req_id,
+                                error=f"cannot start script: {ex}")
+            self._running = True
+            proc = self._proc
+            threading.Thread(target=self._read_output,
+                             args=(proc, job), daemon=True).start()
+        print(f"script: job {job} started (released {released} device(s))",
+              flush=True)
+        if self.echo_code:
+            print(f"script: job {job} source:", flush=True)
+            print(code, end="" if code.endswith("\n") else "\n", flush=True)
+            print(f"script: job {job} source end", flush=True)
+        return OpResult(ok=True, req_id=req_id, value=job)
+
+    def _read_output(self, proc: subprocess.Popen, job: int) -> None:
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    with self._lock:
+                        self._lines.append(line.rstrip("\n"))
+            proc.wait()
+        finally:
+            with self._lock:
+                # Finalize atomically: once status() reports "not running",
+                # halted must already be False (no observer race).
+                if self._proc is proc:
+                    self._exit = proc.returncode
+                    self._running = False
+                    self.dispatcher.halted = False
+            print(f"script: job {job} exited with code {proc.returncode}",
+                  flush=True)
+
+    def stop(self) -> OpResult:
+        """Terminate the running job (SIGTERM, then SIGKILL after 2 s)."""
+        with self._lock:
+            proc = self._proc
+            running = self._running
+        if proc is None or not running:
+            return OpResult(ok=False, error="no script is running")
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        return OpResult(ok=True)
+
+    def status(self) -> protocol.ScriptStatus:
+        with self._lock:
+            return protocol.ScriptStatus(
+                enabled=self.enabled,
+                running=self._running,
+                job=self._job,
+                exit=self._exit,
+                output="\n".join(self._lines),
+            )
+
+
 class _Handler(BaseHTTPRequestHandler):
-    """Two endpoints: POST /op and GET /state. JSON only, CORS-friendly."""
+    """Three endpoints: POST /op, POST /script(/stop), GET /state. JSON only."""
 
     dispatcher: Dispatcher | None = None  # bound in main()
+    runner: ScriptRunner | None = None    # bound in main()
     server_version = "picontrol"
     sys_version = ""  # don't advertise the Python version
 
@@ -393,16 +662,29 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
-    def do_POST(self) -> None:
-        if self._path() != "/op":
-            self._reply(404, protocol.encode_result(
-                OpResult(ok=False, error="unknown endpoint (use POST /op)")))
-            return
+    def _read_body(self, limit: int) -> bytes:
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
-        body = self.rfile.read(min(max(length, 0), protocol.MAX_BODY + 1))
+        return self.rfile.read(min(max(length, 0), limit))
+
+    def do_POST(self) -> None:
+        path = self._path()
+        if path == "/op":
+            self._handle_op()
+        elif path == "/script":
+            self._handle_script()
+        elif path == "/script/stop":
+            self._handle_script_stop()
+        else:
+            self._reply(404, protocol.encode_result(OpResult(
+                ok=False,
+                error="unknown endpoint (use POST /op, POST /script, "
+                      "POST /script/stop)")))
+
+    def _handle_op(self) -> None:
+        body = self._read_body(protocol.MAX_BODY + 1)
         try:
             op = protocol.parse_op(body)
         except ProtocolError as ex:
@@ -411,6 +693,32 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(400, protocol.encode_result(result))
             return
         result = self.dispatcher.dispatch(op)
+        self._reply(200 if result.ok else 400, protocol.encode_result(result))
+
+    def _handle_script(self) -> None:
+        body = self._read_body(protocol.MAX_SCRIPT_BODY + 256)
+        try:
+            code, req_id = protocol.parse_script(body)
+        except ProtocolError as ex:
+            result = OpResult(ok=False, error=str(ex))
+            _log(0, f"malformed script: {len(body)} bytes", result)
+            self._reply(400, protocol.encode_result(result))
+            return
+        if self.runner is None:
+            self._reply(400, protocol.encode_result(
+                OpResult(ok=False, req_id=req_id,
+                         error="code execution disabled — start pi.py with --allow-code")))
+            return
+        result = self.runner.start(code, req_id)
+        self._reply(200 if result.ok else 400, protocol.encode_result(result))
+
+    def _handle_script_stop(self) -> None:
+        if self.runner is None:
+            self._reply(400, protocol.encode_result(
+                OpResult(ok=False,
+                         error="code execution disabled — start pi.py with --allow-code")))
+            return
+        result = self.runner.stop()
         self._reply(200 if result.ok else 400, protocol.encode_result(result))
 
     def do_GET(self) -> None:
@@ -425,7 +733,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(500, protocol.encode_result(
                 OpResult(ok=False, error=f"state failed: {type(ex).__name__}")))
             return
-        self._reply(200, protocol.encode_state(states))
+        script = self.runner.status() if self.runner is not None else None
+        self._reply(200, protocol.encode_state(states, script=script))
 
     def log_message(self, fmt: str, *args) -> None:
         pass  # transaction log above replaces the default stderr access log
@@ -433,13 +742,30 @@ class _Handler(BaseHTTPRequestHandler):
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="pi.py", description="picontrol controller bridge for Raspberry Pi")
+        prog="pi.py", description="picontrol controller bridge for Raspberry Pi",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="endpoints: POST /op (one op), GET /state (all states + script\n"
+               "status), POST /script and POST /script/stop (with --allow-code).\n"
+               "\n"
+               "examples:\n"
+               "  python3 pi.py                        # live GPIO on a Pi\n"
+               "  python3 pi.py --port 8643            # different port\n"
+               "  python3 pi.py --dev                  # PC: no hardware\n"
+               "  python3 pi.py --dev --allow-code     # PC: also let the GUI run\n"
+               "                                       # scripts (source echoed\n"
+               "                                       # to the console)\n"
+               "  python3 pi.py --allow-code           # Pi: scripts allowed,\n"
+               "                                       # no source echo\n")
     parser.add_argument("--host", default="0.0.0.0",
                         help="bind address (default: all interfaces)")
     parser.add_argument("--port", type=int, default=protocol.DEFAULT_PORT,
                         help=f"TCP port (default: {protocol.DEFAULT_PORT})")
     parser.add_argument("--dev", action="store_true",
                         help="mock pins + synthetic sensor values (no Pi hardware)")
+    parser.add_argument("--allow-code", action="store_true",
+                        help="allow the GUI to run Python scripts on this machine "
+                             "(POST /script; off by default; with --dev the "
+                             "script source is echoed to the console)")
     args = parser.parse_args(argv)
 
     if args.dev:
@@ -468,7 +794,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     dispatcher = Dispatcher(dev=args.dev)
-    handler = type("BoundHandler", (_Handler,), {"dispatcher": dispatcher})
+    runner = ScriptRunner(dispatcher, enabled=args.allow_code,
+                          echo_code=args.dev and args.allow_code)
+    dispatcher.script = runner
+    handler = type("BoundHandler", (_Handler,),
+                   {"dispatcher": dispatcher, "runner": runner})
     try:
         server = ThreadingHTTPServer((args.host, args.port), handler)
     except OSError as ex:
@@ -480,6 +810,10 @@ def main(argv: list[str] | None = None) -> int:
         mode = "dev: mock pins + synthetic sensors"
     else:
         mode = f"live GPIO via {type(gpiozero.Device.pin_factory).__name__}"
+    if args.allow_code:
+        mode += ", script execution ALLOWED (--allow-code)"
+    else:
+        mode += ", script execution disabled"
     print(f"picontrol bridge listening on {args.host}:{args.port} [{mode}]",
           flush=True)
     try:

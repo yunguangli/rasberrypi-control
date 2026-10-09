@@ -10,15 +10,20 @@ from protocol import (
     KNOWN_OPS,
     MAX_ABS_VALUE,
     MAX_BODY,
+    MAX_SCRIPT_BODY,
     Op,
     OpResult,
     PinState,
     ProtocolError,
+    ScriptStatus,
     encode_op,
     encode_result,
+    encode_script,
     encode_state,
     parse_op,
     parse_result,
+    parse_script,
+    parse_script_status,
     parse_state,
 )
 
@@ -86,6 +91,14 @@ def test_parse_op_accepts_float_pwm_value():
     assert op.value == 62.5
 
 
+def test_parse_op_accepts_packed_rgb_and_negative_motor():
+    """rgb_write maxes out at 0xRRGGBB; motor_write goes negative."""
+    op = parse_op(b'{"op":"rgb_write","pin":19,"value":16777215}')
+    assert op.value == 0xFFFFFF
+    op = parse_op(b'{"op":"motor_write","pin":13,"value":-75.5}')
+    assert op.value == -75.5
+
+
 # ------------------------------------------------------------------ results --
 
 def test_result_roundtrip():
@@ -129,6 +142,54 @@ def test_state_roundtrip():
 def test_parse_state_rejects_shapes(body):
     with pytest.raises(ProtocolError):
         parse_state(body)
+
+
+# ------------------------------------------------------------------ script ---
+
+def test_script_roundtrip():
+    body = encode_script("print('hi')", req_id=5)
+    code, req_id = parse_script(body)
+    assert code == "print('hi')" and req_id == 5
+
+
+@pytest.mark.parametrize("body", [
+    b"",
+    b"not json",
+    b"[]",
+    b"{}",                                   # missing script
+    b'{"script": ""}',                       # empty
+    b'{"script": "   "}',                    # whitespace only
+    b'{"script": 42}',                       # wrong type
+    # too big: explicit short id — the 64 KiB body must not end up in the
+    # test ID (Windows caps env vars at 32767 chars: PYTEST_CURRENT_TEST).
+    pytest.param(b'{"script": "' + b"x" * (MAX_SCRIPT_BODY + 1) + b'"}',
+                 id="too-big"),
+])
+def test_parse_script_rejects(body):
+    with pytest.raises(ProtocolError):
+        parse_script(body)
+
+
+def test_script_status_roundtrip_in_state():
+    states = [PinState(bcm=17, direction="out", value=True)]
+    script = ScriptStatus(enabled=True, running=True, job=3,
+                          output="hello\nworld")
+    body = encode_state(states, script=script)
+    assert parse_state(body) == states
+    assert parse_script_status(body) == script
+
+
+def test_script_status_absent_means_disabled():
+    """An old bridge (no 'script' key) degrades to 'not enabled'."""
+    assert parse_script_status(encode_state([])) == ScriptStatus()
+
+
+@pytest.mark.parametrize("body", [b"", b"nope", b'{"script": 7}',
+                                  b'{"script": {"job": "x"}}'])
+def test_parse_script_status_is_total(body):
+    """A garbled script block never raises — it becomes the default."""
+    status = parse_script_status(body)
+    assert status.enabled is False and status.running is False
 
 
 # ------------------------------------------------------------- cross-module --
