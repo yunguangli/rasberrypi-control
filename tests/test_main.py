@@ -33,6 +33,7 @@ async def test_gui_renders_from_profile(flet_app: ftt.FletTestApp):
     # Connection bar + section controls
     assert (await tester.find_by_key("host")).count == 1
     assert (await tester.find_by_key("connect")).count == 1
+    assert (await tester.find_by_key("preset")).count == 1
     assert (await tester.find_by_key("board-toggle")).count == 1
     assert (await tester.find_by_key("all-off")).count == 1
 

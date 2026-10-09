@@ -38,6 +38,13 @@ REQUEST_TIMEOUT = 3.0            # per-request urllib timeout
 LOG_LINES = 16                   # activity log depth
 PULSE_MS = 300                   # click-to-pulse duration for the buzzer
 
+# Quick-pick targets for the dropdown under the host field: this machine
+# (where `pi.py --dev` runs) and the Pi on the LAN.
+TARGET_PRESETS: tuple[str, ...] = (
+    f"127.0.0.1:{protocol.DEFAULT_PORT}",
+    f"192.168.1.118:{protocol.DEFAULT_PORT}",
+)
+
 # RGB LED preset swatches (avoid the ColorPicker: it needs an extra package).
 _RGB_SWATCHES: tuple[tuple[str, int], ...] = (
     ("off", 0x000000),
@@ -197,6 +204,7 @@ class App:
         self.dot: ft.Container | None = None
         self.conn_text: ft.Text | None = None
         self.host_field: ft.TextField | None = None
+        self.preset_dropdown: ft.Dropdown | None = None
         self.log_column: ft.Column | None = None
         self.toggles: list[ft.Control] = []
         self.switches: dict[int, ft.Switch] = {}
@@ -304,6 +312,15 @@ class App:
             key="host",
             on_submit=self._on_connect,
         )
+        self.preset_dropdown = ft.Dropdown(
+            options=[ft.DropdownOption(key=p, text=p) for p in TARGET_PRESETS],
+            value=self.client.base.removeprefix("http://"),
+            label="quick targets",
+            width=190 if self.narrow else 230,
+            key="preset",
+            dense=True,
+            on_select=self._on_preset,
+        )
         connect = ft.Button(content="Connect", key="connect",
                             on_click=self._on_connect)
         self.dot = ft.Container(width=12, height=12, border_radius=6,
@@ -311,7 +328,11 @@ class App:
         self.conn_text = ft.Text("waiting for the Pi…", size=12,
                                  color="#546E7A")
         return ft.Row(
-            controls=[self.host_field, connect, self.dot, self.conn_text],
+            controls=[
+                ft.Column(controls=[self.host_field, self.preset_dropdown],
+                          spacing=6),
+                connect, self.dot, self.conn_text,
+            ],
             wrap=True,
             spacing=10,
             run_spacing=6,
@@ -319,7 +340,14 @@ class App:
         )
 
     def _on_connect(self, e: ft.ControlEvent) -> None:
-        raw = (self.host_field.value if self.host_field else "") or ""
+        self._apply_target(
+            (self.host_field.value if self.host_field else "") or "")
+
+    def _on_preset(self, e: ft.ControlEvent) -> None:
+        self._apply_target(self.preset_dropdown.value or "")
+
+    def _apply_target(self, raw: str) -> None:
+        """Point the client at `host[:port]` and mirror it in the widgets."""
         raw = raw.strip().removeprefix("http://").rstrip("/")
         if ":" in raw:
             host, _, port_text = raw.rpartition(":")
@@ -331,7 +359,13 @@ class App:
                 self.client.host = host
         elif raw:
             self.client.host = raw
-        self.host_field.value = f"{self.client.host}:{self.client.port}"
+        if self.host_field is not None:
+            self.host_field.value = f"{self.client.host}:{self.client.port}"
+        # Keep the quick-pick in sync: preselect an exact preset, clear the
+        # selection when a custom address was typed.
+        if self.preset_dropdown is not None:
+            base = self.client.base.removeprefix("http://")
+            self.preset_dropdown.value = base if base in TARGET_PRESETS else None
         self._push_log(f"target -> {self.client.base}", True)
         self.page.update()
         self.page.run_task(self._poll_once)

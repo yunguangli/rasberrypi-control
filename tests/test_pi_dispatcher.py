@@ -280,6 +280,23 @@ def test_distance_read_never_blocks(dsp):
     dev.close()  # release the mock pins and stop the sample thread
 
 
+def test_load_average_shim_keeps_the_contract_and_is_silent(capsys):
+    """Stand-in for gpiozero.LoadAverage: same .load_average/.close() contract
+    the Dispatcher uses, without 1.6.2's per-read `print(repr(f))` flood."""
+    la = pi._LoadAverage(minutes=1)
+
+    value = la.load_average
+    assert isinstance(value, float) and value >= 0.0
+    la.close()  # must not raise — the Dispatcher closes every device
+
+    with pytest.raises(ValueError):
+        pi._LoadAverage(minutes=7)
+
+    for _ in range(3):  # reads must stay mute
+        la.load_average
+    assert capsys.readouterr().out == ""
+
+
 # -------------------------------------------------- validation boundaries ----
 
 def test_unknown_pin_rejected(dsp):
@@ -619,6 +636,55 @@ def test_live_mode_fails_fast_without_pin_factory(monkeypatch, capsys):
     assert "no usable GPIO pin factory" in err
     assert "--dev" in err
     assert "Raspberry Pi" in err
+
+
+def test_live_mode_refuses_mock_pin_factory(capsys):
+    """gpiozero 2.x falls back to MockFactory silently; live mode must refuse
+    to serve instead of driving nothing (the Pi-side MockFactory surprise)."""
+
+    assert pi.main(["--port", "0"]) == 1
+    err = capsys.readouterr().err
+    assert "MOCK pins" in err
+    assert "python3-lgpio" in err
+
+
+def test_pin_factory_resolution_falls_back_on_gpiozero_1_6(monkeypatch):
+    """1.6.x has no Device.ensure_pin_factory(); resolution must fall back to
+    Device._default_pin_factory() and cache it like Device.__init__ does."""
+
+    monkeypatch.delattr(gpiozero.Device, "ensure_pin_factory")
+    monkeypatch.setattr(gpiozero.Device, "pin_factory", None)
+
+    factory = pi._resolve_pin_factory()
+
+    assert factory.__name__ == "MockFactory"  # conftest forces the mock env
+    assert gpiozero.Device.pin_factory is not None
+
+
+def test_live_mode_refuses_mock_on_gpiozero_1_6(monkeypatch, capsys):
+    """Same refusal as on 2.x, reached through the 1.6.x resolution path."""
+
+    monkeypatch.delattr(gpiozero.Device, "ensure_pin_factory")
+
+    assert pi.main(["--port", "0"]) == 1
+    err = capsys.readouterr().err
+    assert "MOCK pins" in err
+    assert "python3-lgpio" in err
+
+
+def test_missing_setuptools_gets_its_own_hint(monkeypatch, capsys):
+    """gpiozero 1.6.x imports pkg_resources from pins.mock, so a slim venv
+    fails with a ModuleNotFoundError that the generic hint won't fix."""
+
+    def _no_pkg_resources(dev=False):
+        raise ModuleNotFoundError("No module named 'pkg_resources'")
+
+    monkeypatch.setattr(pi, "_resolve_pin_factory", _no_pkg_resources)
+
+    assert pi.main(["--port", "0"]) == 1
+    err = capsys.readouterr().err
+    assert "pkg_resources" in err
+    assert 'pip install "setuptools<81"' in err
 
 
 def test_all_off_reports_one_line_per_failure(dsp, monkeypatch, capsys):

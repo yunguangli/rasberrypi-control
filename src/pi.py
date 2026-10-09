@@ -109,6 +109,29 @@ def _dht22(bcm: int):
         ) from ex
 
 
+class _LoadAverage:
+    """Minimal stand-in for gpiozero.LoadAverage: `.load_average` + `.close()`.
+
+    Why not gpiozero's: 1.6.2's implementation prints the open file object on
+    every read (`print(repr(f))` shipped in the release), which floods the
+    console once per poll. 2.0 fixed that, but reading /proc/loadavg is two
+    stdlib lines and behaves identically on both versions.
+    """
+
+    def __init__(self, minutes: int = 1) -> None:
+        if minutes not in (1, 5, 15):
+            raise ValueError("minutes must be 1, 5, or 15")
+        self._column = {1: 0, 5: 1, 15: 2}[minutes]
+
+    @property
+    def load_average(self) -> float:
+        with open("/proc/loadavg") as f:
+            return float(f.read().split()[self._column])
+
+    def close(self) -> None:
+        pass  # no pin to release — kept for the Dispatcher device contract
+
+
 def _log(req_id: int, description: str, result: OpResult) -> None:
     """One console line per transaction — pi.py's 'view'."""
     stamp = time.strftime("%H:%M:%S")
@@ -251,7 +274,8 @@ class Dispatcher:
             if drv == "CPUTemperature":
                 return gpiozero.CPUTemperature()
             if drv == "LoadAverage":
-                return gpiozero.LoadAverage(minutes=1)
+                # our stand-in: gpiozero 1.6.2's prints the file on every read
+                return _LoadAverage(minutes=1)
         raise RuntimeError(f"cannot build a device for {profile.name} ({drv}/{role})")
 
     # ------------------------------------------------------------- sensors --
@@ -740,6 +764,31 @@ class _Handler(BaseHTTPRequestHandler):
         pass  # transaction log above replaces the default stderr access log
 
 
+def _resolve_pin_factory(dev: bool = False) -> type:
+    """Make gpiozero pick its pin factory now; return the factory class.
+
+    gpiozero >= 2.0 exposes Device.ensure_pin_factory(); 1.6.x resolves the
+    factory lazily inside Device.__init__ (via Device._default_pin_factory())
+    and raises BadPinFactory when nothing loads. Cache the result on Device
+    the same way Device.__init__ would, so this file runs unchanged on both.
+
+    Dev mode builds MockFactory with the pin CLASS rather than the
+    GPIOZERO_MOCK_PIN_CLASS name: 1.6.x resolves name strings through
+    pkg_resources, which a slim venv need not have.
+    """
+    if dev:
+        from gpiozero.pins.mock import MockFactory, MockPWMPin
+        gpiozero.Device.pin_factory = MockFactory(pin_class=MockPWMPin)
+        return MockFactory
+    ensure = getattr(gpiozero.Device, "ensure_pin_factory", None)
+    if ensure is not None:
+        ensure()
+        return type(gpiozero.Device.pin_factory)
+    factory = gpiozero.Device._default_pin_factory()
+    gpiozero.Device.pin_factory = factory
+    return type(factory)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="pi.py", description="picontrol controller bridge for Raspberry Pi",
@@ -780,13 +829,37 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # hide gpiozero's fallback spam
-            gpiozero.Device.ensure_pin_factory()
+            factory = _resolve_pin_factory(dev=args.dev)
     except Exception as ex:
         print(f"pi.py: no usable GPIO pin factory "
               f"({type(ex).__name__}: {ex})",
               file=sys.stderr, flush=True)
+        if "pkg_resources" in str(ex):
+            # gpiozero 1.6.x's pins.mock imports pkg_resources at module
+            # level — every mock-pin route dies without it, and setuptools
+            # removed pkg_resources in 81.
+            print('pi.py:   gpiozero 1.6.x needs pkg_resources: '
+                  'pip install "setuptools<81"',
+                  file=sys.stderr, flush=True)
         print("pi.py:   on a Raspberry Pi: install lgpio "
               "(sudo apt install python3-lgpio) or RPi.GPIO",
+              file=sys.stderr, flush=True)
+        print("pi.py:   on a PC without hardware: run with --dev "
+              "(mock pins + synthetic sensors)",
+              file=sys.stderr, flush=True)
+        return 1
+
+    # gpiozero 2.x falls back to MockFactory SILENTLY when it can't load a
+    # real factory — live mode would then serve happily while nothing
+    # electrical ever happens (1.6.x raises instead, caught above). Refuse
+    # rather than pretend.
+    if (not args.dev
+            and factory.__name__ == "MockFactory"):
+        print("pi.py: no real GPIO pin factory — live mode would only drive "
+              "MOCK pins (nothing electrical would happen)",
+              file=sys.stderr, flush=True)
+        print("pi.py:   on a Raspberry Pi: install lgpio "
+              "(sudo apt install python3-lgpio), then re-run",
               file=sys.stderr, flush=True)
         print("pi.py:   on a PC without hardware: run with --dev "
               "(mock pins + synthetic sensors)",
@@ -809,7 +882,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.dev:
         mode = "dev: mock pins + synthetic sensors"
     else:
-        mode = f"live GPIO via {type(gpiozero.Device.pin_factory).__name__}"
+        mode = f"live GPIO via {factory.__name__}"
     if args.allow_code:
         mode += ", script execution ALLOWED (--allow-code)"
     else:

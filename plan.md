@@ -239,7 +239,8 @@ on mobile — it **raises on desktop**, so call it only when `page.platform` is 
 Layout, top → bottom:
 
 ```
-Connection bar   host:port field, Connect, status dot, last-poll latency
+Connection bar   host:port field + quick-targets dropdown (localhost / Pi),
+                   Connect, status dot, last-poll latency
 BOARD            2×20 horizontal strip (collapsible toggle)
                    ring color = function family (pinout.xyz palette)
                    fill/badge = live state: OUT=0 blue, OUT=1 green, IN=1 flash,
