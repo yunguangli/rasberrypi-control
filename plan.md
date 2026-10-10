@@ -33,7 +33,7 @@ Remote control of a Raspberry Pi's GPIO from a PC/laptop:
 | Pin list | **Shared pin profile** — one module drives *both* `pi.py` validation and GUI layout, so they cannot drift. |
 | Devices planned | All four roles: outputs (LED/relay/buzzer), inputs (button/PIR), sensors (temp/distance/light), PWM (dimmer/motor). |
 | Light sensor | **Deferred** — needs an ADC (MCP3008/ADS1115); profile entry marked `needs_adc=True`, rendered disabled. |
-| Board visualization | **Hybrid**: image-2 pinout cell design (function-family colors, physical # + BCM + alt-function) arranged image-1 style as a **2×20 horizontal strip**, plus live state overlay. Generated from the header table — never transcribed (image 1 had pins 12/14 swapped). |
+| Board visualization | **Hybrid**: image-2 pinout cell design (function-family colors, physical # + BCM + alt-function) arranged image-1 style as a **2×20 horizontal strip** — the reference diagram rotated 90° clockwise: its left column (1,3…39) is the top row and its right column (2,4…40) the second row, pins 1/2 at the right end — plus live state overlay. Generated from the header table — never transcribed (image 1 had pins 12/14 swapped). |
 | External emulator (nosix/raspberry-gpio-emulator) | **Not a dependency.** Abandoned py3.5-era code, separate Tk window, can't emulate timing-based sensors anyway. Optional later spike: `pi.py --dev-pins=emulator` + `GPIOZERO_PIN_FACTORY=rpigpio`. Mock pins + our own Board panel cover it. |
 | Pi webserver | **stdlib `http.server`** (`ThreadingHTTPServer`), ~50 lines. No pip-installable framework anywhere on the Pi; gpiozero is the only third-party import. Flet's internal server ruled out (no custom-route API). |
 | Server model | **Threaded, not asyncio.** `ThreadingHTTPServer` gives each request its own thread, so blocking gpiozero calls run directly in the handler — no executor, no event loop (simpler than the original asyncio design). |
@@ -227,7 +227,8 @@ on mobile — it **raises on desktop**, so call it only when `page.platform` is 
 - **One breakpoint**: `width < 600` = narrow mode; re-render sections on `on_resize`.
 - **Narrow layout**: the Board strip switches to the **vertical pinout** (20 rows × 2 cols,
   labels beside cells — the pinout.xyz style fits portrait naturally); wide screens keep
-  the 2×20 horizontal strip. Control sections drop to a single GridView column, the
+  the 2×20 horizontal strip (reference rotated 90° CW: odd pins top, even below, 1/2 at
+  the right end). Control sections drop to a single GridView column, the
   connection bar wraps, touch targets ≥ 44 px.
 - **Install routes** (either way the phone reaches `pi.py`'s host:port over the same WiFi):
   1. **Native APK** — `flet build apk -v` (documented in README); needs Android SDK + JDK

@@ -959,8 +959,12 @@ class App:
         self._render()
 
     def _board_horizontal(self) -> ft.Column:
-        odd = [pins.HEADER[i] for i in range(0, 40, 2)]   # physical 1,3..39
-        even = [pins.HEADER[i] for i in range(1, 40, 2)]  # physical 2,4..40
+        # The reference diagram rotated 90° clockwise: its left column
+        # (1,3..39) becomes the top row and its right column (2,4..40) the
+        # second row, with each column's first pins (1 and 2) at the RIGHT
+        # end. Wide layout only; narrow keeps the untouched vertical pinout.
+        odd = [pins.HEADER[i] for i in range(38, -1, -2)]   # 39,37..1
+        even = [pins.HEADER[i] for i in range(39, -1, -2)]  # 40,38..2
         return ft.Column(
             controls=[
                 ft.Row(controls=[self._board_cell(c) for c in odd],
