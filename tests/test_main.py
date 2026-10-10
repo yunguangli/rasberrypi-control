@@ -58,8 +58,12 @@ async def test_gui_renders_from_profile(flet_app: ftt.FletTestApp):
 
     # Script section (input + run/stop, gated until the bridge allows code)
     assert (await tester.find_by_key("script-code")).count == 1
+    assert (await tester.find_by_key("script-keys")).count == 1
     assert (await tester.find_by_key("script-run")).count == 1
     assert (await tester.find_by_key("script-stop")).count == 1
+    assert (await tester.find_by_key("script-clear")).count == 1
+    assert (await tester.find_by_key("script-indent")).count == 1
+    assert (await tester.find_by_key("script-outdent")).count == 1
 
     # Every wired device renders its card (single source of truth: pins.WIRED)
     for name in WIRED_NAMES:

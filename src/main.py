@@ -37,6 +37,7 @@ POLL_FAIL_SECONDS = 3.0          # slower retry while unreachable
 REQUEST_TIMEOUT = 3.0            # per-request urllib timeout
 LOG_LINES = 16                   # activity log depth
 PULSE_MS = 300                   # click-to-pulse duration for the buzzer
+SCRIPT_INDENT = 4                # spaces per Tab press in the script box
 
 # Quick-pick targets for the dropdown under the host field: this machine
 # (where `pi.py --dev` runs) and the Pi on the LAN.
@@ -196,6 +197,8 @@ class App:
         self.states: dict[int, PinState] = {}
         self.script: ScriptStatus | None = None
         self.script_code: str = ""            # survives re-renders
+        self.script_caret: int = 0           # caret index for the Tab handler
+        self.script_span: tuple[int, int] = (0, 0)  # selected range, if any
         self.pending: set[int] = set()      # BCMs with an op in flight
         self.board_open = True
         self.log: list[tuple[str, bool]] = []
@@ -217,6 +220,9 @@ class App:
         self.cell_bgs: dict[int, ft.Container] = {}
         self.cell_badges: dict[int, ft.Text] = {}
         self.script_field: ft.TextField | None = None
+        self.script_clear: ft.Button | None = None
+        self.script_indent: ft.Button | None = None
+        self.script_outdent: ft.Button | None = None
         self.script_run: ft.Button | None = None
         self.script_stop: ft.Button | None = None
         self.script_status: ft.Text | None = None
@@ -264,8 +270,9 @@ class App:
         # pending, its on_change_end will never arrive, so drop the marks
         # rather than leaving that BCM stuck (polls would skip it forever).
         self.pending.clear()
-        if self.script_field is not None and self.script_field.value is not None:
-            self.script_code = self.script_field.value  # keep the typed script
+        script_box = self.script_text_field
+        if script_box is not None and script_box.value is not None:
+            self.script_code = script_box.value  # keep the typed script
         self.toggles.clear()
         self.switches.clear()
         self.sliders.clear()
@@ -815,6 +822,27 @@ class App:
             # runs; only Run/Stop are gated by connection + --allow-code.
         )
         self.script_field.on_change = self._on_script_edit
+        self.script_field.on_selection_change = self._on_script_selection
+        self.script_field = ft.KeyboardListener(
+            content=self.script_field,
+            key="script-keys",
+            on_key_down=self._on_script_key,
+        )
+        self.script_clear = ft.Button(
+            content="Clear", key="script-clear",
+            disabled=not (self.script_code or "").strip(),
+            on_click=lambda e: self._clear_script(),
+        )
+        # Indent/outdent buttons: Tab does the same thing on a desktop
+        # keyboard, but phones have no Tab key at all.
+        self.script_indent = ft.Button(
+            content="⇥ Indent", key="script-indent",
+            on_click=lambda e: self._indent_script(),
+        )
+        self.script_outdent = ft.Button(
+            content="⇤ Outdent", key="script-outdent",
+            on_click=lambda e: self._indent_script(outdent=True),
+        )
         self.script_run = ft.Button(
             content="Run on Pi", key="script-run", bgcolor="#43A047",
             color="#FFFFFF",
@@ -849,8 +877,10 @@ class App:
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
                 self.script_field,
-                ft.Row(controls=[self.script_run, self.script_stop],
-                       spacing=8),
+                ft.Row(controls=[self.script_run, self.script_stop,
+                                self.script_clear, self.script_indent,
+                                self.script_outdent],
+                       spacing=8, wrap=True),
                 self.script_output,
             ],
             spacing=8,
@@ -858,6 +888,110 @@ class App:
 
     def _on_script_edit(self, e: ft.ControlEvent) -> None:
         self.script_code = e.control.value or ""
+        if self.script_clear is not None:
+            self.script_clear.disabled = not self.script_code.strip()
+
+    @property
+    def script_text_field(self) -> ft.TextField | None:
+        """The script box itself — script_field is its KeyboardListener shell."""
+        listener = self.script_field
+        if isinstance(listener, ft.KeyboardListener):
+            content = listener.content
+            return content if isinstance(content, ft.TextField) else None
+        return listener if isinstance(listener, ft.TextField) else None
+
+    def _on_script_selection(self, e: ft.TextSelectionChangeEvent) -> None:
+        """Remember the caret (and any selected span) for the Tab handler."""
+        selection = getattr(e, "selection", None)
+        if selection is not None and selection.is_valid:
+            self.script_caret = selection.end
+            self.script_span = (selection.start, selection.end)
+
+    def _on_script_key(self, e: ft.KeyDownEvent) -> None:
+        """Tab indents instead of leaving the box — Flutter's focus traversal
+        acts on Tab too and flet 1.0 cannot consume the key, so indent first
+        and pull focus back afterwards."""
+        if e.key not in ("Tab", "Backtab"):
+            return
+        self._indent_script(outdent=e.key == "Backtab")
+        self._refocus_script_box()
+
+    def _indent_script(self, *, outdent: bool = False) -> None:
+        """Indent (or outdent) the caret's line / every selected line.
+
+        Shared by the Tab key and the toolbar buttons — buttons matter on
+        phones, whose on-screen keyboard has no Tab key at all.
+        """
+        field = self.script_text_field
+        if field is None:
+            return
+        text = field.value or ""
+        start, end = self.script_span
+        if not (0 <= start <= end <= len(text)):
+            start = end = min(self.script_caret, len(text))
+        indent = " " * SCRIPT_INDENT
+
+        if end > start:  # selection: indent each non-blank line it touches
+            lines = text[start:end].split("\n")
+            if outdent:
+                lines = [(ln[SCRIPT_INDENT:] if ln.startswith(indent)
+                          else ln.lstrip(" ")) if ln.strip() else ln
+                         for ln in lines]
+            else:
+                lines = [f"{indent}{ln}" if ln.strip() else ln for ln in lines]
+            block = "\n".join(lines)
+            value = text[:start] + block + text[end:]
+            caret = start + len(block)
+        else:  # caret only: indent (or outdent) at the start of its line
+            line_start = text.rfind("\n", 0, start) + 1
+            body = text[line_start:]
+            if outdent:
+                spaces = len(body) - len(body.lstrip(" "))
+                remove = min(spaces, SCRIPT_INDENT)
+                if not remove:
+                    return  # already flush left — leave the text alone
+                value = text[:line_start] + body[remove:]
+                caret = start - remove
+            else:
+                value = text[:line_start] + indent + body
+                caret = start + len(indent)
+        field.value = value
+        field.selection = ft.TextSelection(base_offset=caret,
+                                           extent_offset=caret)
+        self.script_code = value
+        self.script_caret = caret
+        self.script_span = (caret, caret)
+        if self.script_clear is not None:
+            self.script_clear.disabled = not value.strip()
+        self.page.update()
+
+    def _refocus_script_box(self) -> None:
+        """Put the caret back in the script box after a focus-stealing key."""
+        field = self.script_text_field
+        if field is not None:
+            self.page.run_task(field.focus)
+
+    def _clear_script(self) -> None:
+        """Stop a running job first, then empty the script box.
+
+        Clearing while a job runs would leave the Pi executing code that is
+        no longer visible in the GUI — so stop it, and log that we did.
+        """
+        running = bool(self.script and self.script.running)
+        if running:
+            self._push_log("script: stopped (cleared while running)", True)
+            self.page.run_task(self._stop_script)
+        field = self.script_text_field
+        if field is not None:
+            field.value = ""
+            field.selection = ft.TextSelection(base_offset=0, extent_offset=0)
+        self.script_code = ""
+        self.script_caret = 0
+        self.script_span = (0, 0)
+        if self.script_clear is not None:
+            self.script_clear.disabled = True
+        self._push_log("script: cleared", True)
+        self.page.update()
 
     async def _run_script(self) -> None:
         code = self.script_code
