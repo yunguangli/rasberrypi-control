@@ -464,6 +464,31 @@ def test_script_failure_reports_exit_code(dsp):
     assert _finish(r).exit == 3
 
 
+def test_stop_lets_the_script_clean_up(dsp, tmp_path):
+    """Stop must be a clean shutdown, not a hard kill: a bare SIGTERM skips
+    finally-blocks and finalizers, which leaves GPIO pins driven (LED stuck on)
+    and buffered output unsent."""
+    r = pi.ScriptRunner(dsp, enabled=True)
+    dsp.script = r
+    marker = tmp_path / "cleaned"
+    code = (
+        "import time, pathlib\n"
+        f"marker = pathlib.Path({str(marker)!r})\n"
+        "try:\n"
+        "    print('running')\n"
+        "    while True:\n"
+        "        time.sleep(0.05)\n"
+        "finally:\n"
+        f"    marker.write_text('done')\n"
+    )
+    assert r.start(code).ok
+    assert wait_for(lambda: "running" in r.status().output, timeout=5.0), \
+        "unbuffered output should arrive while the job runs"
+    assert r.stop().ok
+    assert wait_for(marker.exists, timeout=5.0), \
+        "cleanup did not run — the job was hard-killed"
+
+
 def test_script_source_echoed_in_dev_mode(dsp, capsys):
     """--dev + --allow-code: print the received source to the console."""
     r = pi.ScriptRunner(dsp, enabled=True, echo_code=True)

@@ -62,6 +62,22 @@ _SYNTHETIC = {
 # A tone op plays for this long, then stops — like pulse, but musical.
 TONE_MS = 400
 
+# Prepended to every script job. SIGTERM/SIGINT normally kill the interpreter
+# outright: no atexit, no finalizers, no flushed stdout — which leaves GPIO
+# pins driven (an LED stuck on) and swallows print() output. Turning the signal
+# into SystemExit lets the interpreter shut down normally, so gpiozero's
+# Device.__del__ closes the devices and buffered output still reaches the GUI.
+_SCRIPT_PREAMBLE = """import signal as _pc_signal
+
+
+def _pc_shutdown(signum, frame):
+    raise SystemExit(0)
+
+
+_pc_signal.signal(_pc_signal.SIGTERM, _pc_shutdown)
+_pc_signal.signal(_pc_signal.SIGINT, _pc_shutdown)
+"""
+
 # A device that failed to construct is not retried on every poll; it is
 # retried after this many seconds (unplugging/replugging a sensor recovers
 # without restarting the bridge).
@@ -591,7 +607,10 @@ class ScriptRunner:
             self._lines.clear()
             try:
                 self._proc = subprocess.Popen(
-                    [sys.executable, "-c", code],
+                    # -u: unbuffered, so prints show up in the GUI while the
+                    # script is still running, not only at exit.
+                    [sys.executable, "-u", "-c",
+                     _SCRIPT_PREAMBLE + code],
                     stdin=subprocess.DEVNULL,      # never block on input()
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,      # merge: one output stream
