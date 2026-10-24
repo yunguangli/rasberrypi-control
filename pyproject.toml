@@ -21,6 +21,9 @@ dev = [
     "flet[test]>=1.0.3",
     # Pi-side GPIO. Only needed on the PC for `pi.py --dev` (mock pins) and
     # the dispatcher tests; the Pi installs gpiozero on its own (apt/pip).
+    # The Pi target is 1.6.2 (RPi.GPIO backend, Python 3.11): the code and the
+    # tests are version-agnostic, so the suite passes on 2.x here and on 1.6.2
+    # there — see AGENTS.md for the separate 3.11/1.6.2 test run.
     "gpiozero>=2.0",
 ]
 

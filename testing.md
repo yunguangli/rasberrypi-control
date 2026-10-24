@@ -13,11 +13,12 @@ Control the Pi from the GUI on your PC/phone; watch/touch the hardware.
 **On the Pi** (live mode, real GPIO):
 
 ```bash
+pip install "gpiozero==1.6.2" "setuptools<81"   # Pi target: Python 3.11 + gpiozero 1.6.2
 python3 pi.py --port 8642              # sections 1–11
 python3 pi.py --port 8642 --allow-code # + section 12 (script tests)
 python3 pi.py --help                   # list every flag
 ```
-→ banner `picontrol bridge listening on 0.0.0.0:8642 [live GPIO via lgpio...]`
+→ banner `picontrol bridge listening on 0.0.0.0:8642 [live GPIO via RPiGPIOFactory...]`
 
 All flags (`--host`, `--port`, `--dev`, `--allow-code`) are documented in
 `README.md`. Script tests need `--allow-code`; everything else works without it.
@@ -49,6 +50,18 @@ All flags (`--host`, `--port`, `--dev`, `--allow-code`) are documented in
 > **Safety:** relay and motor loads use their own supply; share GND with the
 > Pi. Never power a motor from the Pi's 3V3/5V rail for anything bigger than a
 > vibration motor.
+
+## 0b. Layout & navigation (do this first)
+
+| ID | GUI action | Verification |
+|----|-----------|--------------|
+| HW-01 | Wide window (≥ 600 px) | Header (target + status) stays fixed while the page scrolls; the 2×20 board strip is pinned above the **Board / Control / Script** tabs; Script is one click away |
+| HW-02 | Phone portrait (< 600 px) | Bottom navigation **Board · Control · Script**; Control starts directly with the device cards (no full board above them); Script shows the editor and console stacked |
+| HW-03 | Open the **Board** page | 40 detail cards: physical #, GPIO name, BCM, alt function, function family, wired device, live state chip; legend plus a **Wired only** filter |
+| HW-04 | Tap a wired output on the Board page (e.g. #11 Status LED) | Same toggle as its Control card; the chip follows within one poll |
+| HW-05 | Resize/rotate across 600 px | Tabs ↔ bottom nav switch, the current page is kept, no duplicated controls, nothing needs a restart |
+| HW-06 | Activity section: toggle and **Clear** | Body collapses/expands; Clear empties the list; new ops reappear as you use the GUI |
+| HW-07 | Read any label at arm's length | Pin names, subtitles and the log are legible (12–15 px), headings 20 px, sensor values 28 px |
 
 ---
 
@@ -103,7 +116,7 @@ All flags (`--host`, `--port`, `--dev`, `--allow-code`) are documented in
 |----|-----------|------------------------|
 | HW-50 | Watch **Room temp** card for 1–2 min | Value refreshes every poll, plausible room temp (~15–30 °C), no `ERR` |
 | HW-51 | Breathe on / cup the sensor | Reading climbs within ~10–20 s (DHT22 max sample rate ≈ 0.5 Hz — don't expect per-second changes) |
-| HW-52 | Room temp card with the Adafruit driver **not** installed | Red fault `no DHT22 driver: … pip install adafruit-circuitpython-dht …` — actionable text, no crash; then install it and confirm the card recovers (no GUI restart needed) |
+| HW-52 | Room temp card with the Adafruit driver **not** installed | Red fault `no DHT22 driver: … adafruit-circuitpython-dht is unavailable …` — actionable text, no crash; install it (`pip install adafruit-circuitpython-dht`, module `adafruit_dht`), wait ~30 s and the card recovers on its own (failed constructions are retried, no `pi.py` restart) |
 
 ## 6. HC-SR04 distance sensor
 
@@ -118,7 +131,7 @@ All flags (`--host`, `--port`, `--dev`, `--allow-code`) are documented in
 
 | ID | GUI action | Physical verification |
 |----|-----------|------------------------|
-| HW-70 | Live mode, SPI0 not enabled or chip not wired | **Light (ADC)** card shows one readable red fault naming the missing piece (e.g. an SPI-open/`/dev/spidev0.0` error) — no traceback, other cards keep polling; enable SPI0 and the card recovers within ~30 s (failure retry) |
+| HW-70 | Live mode, MCP3008 not wired (or SPI0 not enabled) | The card either shows one readable red fault naming the missing piece (e.g. an SPI-open/`/dev/spidev0.0` error) or a stable near-0 % reading via the software-SPI fallback — no traceback, other cards keep polling; after wiring/enabling SPI0 the card recovers within ~30 s (failure retry). Without the `spidev` package the bridge prints one startup hint (`pip install spidev`) instead of a warning per rebuild |
 | HW-71 | ADC fitted, cover the LDR with your hand, then shine a torch | Value in % drops toward 0 when covered, rises when lit |
 
 ## 8. PWM dimmer
@@ -156,24 +169,29 @@ All flags (`--host`, `--port`, `--dev`, `--allow-code`) are documented in
 | HW-111 | Unplug the Pi's network 30 s, plug back, **Connect** | GUI shows red → green; hardware state matches what the GUI shows (server-authoritative) |
 | HW-112 | Run the GUI from a phone (portrait) against the same Pi | All controls usable; toggling from the phone affects the same hardware; both GUIs agree within a poll |
 | HW-113 | Leave everything on for 10 min | No thermal shutdown, no relay chatter, no drift; CPU temp card tracks the Pi's actual temp |
-| HW-114 | Kill `pi.py` (Ctrl-C) on the Pi | Ctrl-C path logs `shutting down`; relays drop if configured to, GPIO releases — restarting `pi.py` restores control without replugging components |
+| HW-114 | Kill `pi.py` (Ctrl-C **or** SIGTERM/`systemctl stop`) on the Pi | Both paths print `shutting down`; a running script is stopped first (`stopped the running script`), then outputs are switched off and GPIO released — restarting `pi.py` restores control without replugging components |
 | HW-115 | Button + LED combo: press the button while toggling the LED from the GUI | Both directions independent — input state and output state never corrupt each other |
 
 ## 12. Script tests (needs `pi.py --allow-code`)
 
-Restart the bridge with the flag for this section. The Script section's text
-field is always editable (compose while offline or mid-job); only
-**Run on Pi** / **Stop** are gated.
+Restart the bridge with the flag for this section. Open the **Script** page
+(its own tab on wide screens, bottom-nav item in portrait). The editor is
+always editable (compose while offline or mid-job); only
+**Run on Pi** / **Stop** are gated. Add `--console` to the bridge command if
+you also want the job's output on the Pi's terminal while testing.
 
 | ID | GUI action | Physical verification |
 |----|-----------|------------------------|
-| HW-120 | Bridge started **without** `--allow-code`: look at the Script section | **Run on Pi** disabled, status red `requires pi.py --allow-code`; text field still editable |
-| HW-121 | With the flag: paste a GPIO17 blink loop, click **Run on Pi** | Status → `running (job 1)`; **Status LED physically blinks at 1 Hz**; every card shows `script running (GPIO released)`; output pane streams the script's prints, then green `job 1 finished · exit 0` |
+| HW-120 | Bridge started **without** `--allow-code`: open the Script page | **Run on Pi** disabled, status red `requires pi.py --allow-code`; editor still editable |
+| HW-121 | With the flag: paste a GPIO17 blink loop, click **Run on Pi** | Status → `running · job 1`; **Status LED physically blinks at 1 Hz**; every card shows the `halted` chip with `script running (GPIO released)`; the console streams the script's prints, then green `job 1 finished · exit 0` |
 | HW-122 | **Stop** mid-blink | Blinking stops ≤ 2 s; cards go live again; log line `script job N exited with …` |
 | HW-123 | While it runs: toggle a card switch, and click **Run on Pi** again | Both refused in the log: `script is running — stop it first` / `job 1 is still running — stop it first` — no crash |
 | HW-124 | Relay-blink script on GPIO22, then **ALL OFF** | Script stops and the relay drops out |
 | HW-125 | Script prints DHT22 readings while the Room temp card is halted | Output pane shows the script's values; GUI keeps polling (cards resume when the job ends); no bridge crash |
 | HW-126 | Run a script that raises (`1/0`) | Output pane shows the traceback tail; status red `job N finished · exit 1`; bridge still serves the next test |
+| HW-127 | Script starts a helper process (`subprocess.Popen`), then **Stop** | The helper dies too (process-group kill): status returns to idle within ~2 s, no stray CPU load on the Pi |
+| HW-128 | Script prints thousands of lines | Output pane keeps only the tail (≤ 200 lines / 16 KiB); GUI stays responsive |
+| HW-129 | With a job running, `Ctrl-C` / SIGTERM the bridge | Console prints `stopped the running script` before `switched off N output(s)`; no orphaned Python process on the Pi (`ps -ef | grep python`) |
 
 ---
 

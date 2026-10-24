@@ -23,8 +23,10 @@ Part of the 3-file copy set for deployment: pi.py + pins.py + protocol.py
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -109,12 +111,14 @@ def _dht22(bcm: int):
     if cls is not None:
         return cls(bcm)
     try:
-        import adafruit_circuitpython_dht as adafruit_dht
+        import adafruit_dht
         import board
         pin = getattr(board, f"D{bcm}", None)
         if pin is None:
             raise DeviceError(f"board has no D{bcm} pin (BCM numbering expected)")
-        return adafruit_dht.DHT22(pin)
+        # On Linux SBCs the pulseio path is unreliable; Adafruit recommends
+        # bit-banging instead (their dht_simpletest.py does the same).
+        return adafruit_dht.DHT22(pin, use_pulseio=False)
     except DeviceError:
         raise
     except Exception as ex:  # ImportError on a PC, board unsupported, wiring ...
@@ -155,6 +159,29 @@ def _log(req_id: int, description: str, result: OpResult) -> None:
     print(f"{stamp} #{req_id} -> {description:<38} <- {mark}", flush=True)
 
 
+def _spidev_available() -> bool:
+    """Is the `spidev` package importable (MCP3008 hardware-SPI path)?
+
+    Imported lazily / via find_spec: the bridge itself never imports spidev,
+    and the import-boundary test only allows gpiozero as a third-party root.
+    """
+    try:
+        return importlib.util.find_spec("spidev") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _quiet_gpiozero_fallbacks() -> None:
+    """Keep the console for transactions and script output.
+
+    Without `spidev` (hardware SPI) gpiozero prints a full Python warning when
+    it builds the MCP3008 and falls back to bit-banged SPI. The fallback still
+    works, so replace the warning with one plain startup hint instead.
+    """
+    warnings.filterwarnings(
+        "ignore", message=r".*falling back to software.*")
+
+
 def _describe(op: Op) -> str:
     if op.op in protocol.SYSTEM_OPS:
         return op.op
@@ -189,6 +216,9 @@ class Dispatcher:
         self._failed: dict[int, tuple[str, float]] = {}   # bcm -> (msg, retry_at)
         self._ctor_lock = threading.Lock()
         self._sensor_lock = threading.Lock()  # non-gpiozero sensor reads
+        # Serializes state reads with script start/stop: a script must never
+        # start while a /state request is still building devices.
+        self._lifecycle_lock = threading.RLock()
         self._started = time.monotonic()
         # Set while a GUI-submitted script job owns the GPIO: every pin op
         # (except noop/all_off) is refused with a clear error.
@@ -237,18 +267,48 @@ class Dispatcher:
         processes, so the bridge must let go of the GPIO before the child
         process claims it. Devices are rebuilt lazily on the next op.
         """
-        with self._ctor_lock:
-            devices = list(self._devices.values())
-            self._devices.clear()
-            self._failed.clear()
-        closed = 0
-        for dev in devices:
-            try:
-                dev.close()
-                closed += 1
-            except Exception:  # noqa: BLE001 — best effort; never block the script
-                pass
-        return closed
+        with self._lifecycle_lock:
+            with self._ctor_lock:
+                devices = list(self._devices.values())
+                self._devices.clear()
+                self._failed.clear()
+            closed = 0
+            for dev in devices:
+                try:
+                    # gpiozero 1.6.x (the Pi target): DistanceSensor.close()
+                    # sets self._trigger = None *before* stopping its sampling
+                    # thread, so a sample in flight dies with
+                    # "AttributeError: 'NoneType' object has no attribute 'pin'".
+                    # Stop the sampler first, then close.
+                    queue = getattr(dev, "_queue", None)
+                    if queue is not None:
+                        try:
+                            queue.stop()
+                        except Exception:  # noqa: BLE001 — best effort
+                            pass
+                    close = getattr(dev, "close", None)
+                    if close is not None:
+                        close()
+                    else:
+                        # Adafruit's DHT driver exposes exit(), not close().
+                        exit_ = getattr(dev, "exit", None)
+                        if exit_ is not None:
+                            exit_()
+                    closed += 1
+                except Exception:  # noqa: BLE001 — best effort; never block the script
+                    pass
+            return closed
+
+    def begin_script(self) -> int:
+        """Halt pin ops and release the GPIO for a script subprocess."""
+        with self._lifecycle_lock:
+            self.halted = True
+            return self.release_all()
+
+    def end_script(self) -> None:
+        """The script has finished; let the next request rebuild devices."""
+        with self._lifecycle_lock:
+            self.halted = False
 
     def _create(self, profile: PinProfile):
         drv, role, bcm = profile.driver, profile.role, profile.bcm
@@ -284,9 +344,10 @@ class Dispatcher:
                 return gpiozero.DistanceSensor(trigger=bcm, echo=profile.echo,
                                                partial=True)
             if drv == "LDR":
-                # gpiozero's LightSensor takes an analog pin; the MCP3008 on
-                # SPI0 (CE0) provides it. Needs spidev + SPI enabled.
-                return gpiozero.LightSensor(gpiozero.MCP3008(channel=0))
+                # MCP3008 is already an AnalogInputDevice: it exposes .value
+                # (0..1). LightSensor is for a capacitor-timed LDR on a GPIO
+                # pin, so wrapping the ADC in it is wrong.
+                return gpiozero.MCP3008(channel=0)
             if drv == "CPUTemperature":
                 return gpiozero.CPUTemperature()
             if drv == "LoadAverage":
@@ -317,7 +378,7 @@ class Dispatcher:
         if profile.driver == "HCSR04":
             return float(dev.distance)
         if profile.driver == "LDR":
-            # LightSensor.value: 0 (dark) .. 1 (bright) — report as % bright.
+            # MCP3008.value: 0 (dark) .. 1 (bright) — report as % bright.
             return round(float(dev.value) * 100.0, 1)
         if profile.driver == "CPUTemperature":
             return round(float(dev.temperature), 1)
@@ -477,10 +538,24 @@ class Dispatcher:
 
         if op.op == "digital_read":
             dev = self._device(profile)
-            return OpResult(ok=True, req_id=req, value=bool(dev.value))
+            if profile.driver == "TonalBuzzer":
+                # value is None when silent; 0.0 is the mid tone (A4).
+                value = dev.value is not None
+            elif profile.driver == "RGBLED":
+                value = any(dev.value)
+            else:
+                value = bool(dev.value)
+            return OpResult(ok=True, req_id=req, value=value)
 
         if op.op == "read":
-            return OpResult(ok=True, req_id=req, value=self._read_sensor(profile))
+            try:
+                value = self._read_sensor(profile)
+            except DeviceError:
+                raise
+            except Exception as ex:  # hardware read fault, not a bridge bug
+                raise DeviceError(
+                    f"{profile.name}: {type(ex).__name__}: {ex}") from None
+            return OpResult(ok=True, req_id=req, value=value)
 
         if op.op == "set_input":
             level = _level(op.value)
@@ -499,31 +574,33 @@ class Dispatcher:
     def all_off(self) -> int:
         """Safety net: de-energise every output/PWM device. Returns count."""
         off = 0
-        for profile in pins.PROFILE.values():
-            if profile.role not in (Role.OUTPUT, Role.PWM) or profile.needs_adc:
-                continue
-            try:
-                dev = self._device(profile)
-                if profile.role is Role.PWM:
-                    dev.value = 0.0
-                elif profile.driver == "TonalBuzzer":
-                    dev.stop()   # no off() on TonalBuzzer
-                else:
-                    dev.off()
-                off += 1
-            except Exception as ex:  # noqa: BLE001 — one line per device, keep going
-                print(f"all_off: {profile.name} failed: "
-                      f"{type(ex).__name__}: {ex}",
-                      file=sys.stderr, flush=True)
+        with self._lifecycle_lock:
+            for profile in pins.PROFILE.values():
+                if profile.role not in (Role.OUTPUT, Role.PWM) or profile.needs_adc:
+                    continue
+                try:
+                    dev = self._device(profile)
+                    if profile.role is Role.PWM:
+                        dev.value = 0.0
+                    elif profile.driver == "TonalBuzzer":
+                        dev.stop()   # no off() on TonalBuzzer
+                    else:
+                        dev.off()
+                    off += 1
+                except Exception as ex:  # noqa: BLE001 — one line per device, keep going
+                    print(f"all_off: {profile.name} failed: "
+                          f"{type(ex).__name__}: {ex}",
+                          file=sys.stderr, flush=True)
         return off
 
     # --------------------------------------------------------------- state --
 
     def state(self) -> list[PinState]:
         """One row per wired device — a single GET refreshes the whole GUI."""
-        if self.halted:
-            return [self._halted_row(p) for p in pins.PROFILE.values()]
-        return [self._state_row(p) for p in pins.PROFILE.values()]
+        with self._lifecycle_lock:
+            if self.halted:
+                return [self._halted_row(p) for p in pins.PROFILE.values()]
+            return [self._state_row(p) for p in pins.PROFILE.values()]
 
     @staticmethod
     def _halted_row(profile: PinProfile) -> PinState:
@@ -574,22 +651,31 @@ class ScriptRunner:
     - One job at a time; starting one releases every GPIO device first
       (gpiozero can't share pins across processes) and halts pin ops.
     - Stop = SIGTERM (then SIGKILL after 2 s) — the GUI's panic button.
-    - stdout+stderr are merged into a bounded tail the GUI can display.
+    - stdout+stderr are merged into a bounded tail the GUI can display
+      (last N lines / 16 KiB, including a truncation marker).
     """
 
     OUTPUT_TAIL_LINES = 200   # keep the last N lines for GET /state
+    OUTPUT_TAIL_BYTES = 16_384  # ...but never resend an unbounded tail
+    TRUNCATION_MARKER = "… earlier output truncated …"
 
     def __init__(self, dispatcher: Dispatcher, *, enabled: bool = False,
-                 echo_code: bool = False) -> None:
+                 echo_code: bool = False,
+                 echo_console: bool = False) -> None:
         self.dispatcher = dispatcher
         self.enabled = enabled
         self.echo_code = echo_code  # --dev + --allow-code: print the source
+        self.echo_console = echo_console  # --console: tee output to the Pi log
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
         self._running = False      # cleared only by the reader's finalization
         self._job = 0
         self._exit: int | None = None
-        self._lines: deque[str] = deque(maxlen=self.OUTPUT_TAIL_LINES)
+        # Trimmed by hand (not deque(maxlen=...)) so the dropped-line count
+        # can raise the truncation marker and the byte total stays O(1).
+        self._lines: deque[str] = deque()
+        self._bytes = 0
+        self._truncated = False
 
     def start(self, code: str, req_id: int = 0) -> OpResult:
         if not self.enabled:
@@ -599,12 +685,19 @@ class ScriptRunner:
             if self._running:
                 return OpResult(ok=False, req_id=req_id,
                                 error=f"job {self._job} is still running — stop it first")
-            released = self.dispatcher.release_all()
-            self.dispatcher.halted = True
+            # Halt BEFORE releasing: a /state that already passed its check
+            # must not rebuild a device while the child is starting.
+            released = self.dispatcher.begin_script()
             self._job += 1
             job = self._job
             self._exit = None
             self._lines.clear()
+            self._bytes = 0
+            self._truncated = False
+            popen_kwargs = {}
+            if os.name == "posix":
+                # Own process group: stop() can then signal grandchildren too.
+                popen_kwargs["start_new_session"] = True
             try:
                 self._proc = subprocess.Popen(
                     # -u: unbuffered, so prints show up in the GUI while the
@@ -616,11 +709,12 @@ class ScriptRunner:
                     stderr=subprocess.STDOUT,      # merge: one output stream
                     text=True, encoding="utf-8", errors="replace",
                     env=os.environ.copy(),         # inherits mock-pin vars in --dev
+                    **popen_kwargs,
                 )
             except OSError as ex:
                 self._proc = None
                 self._running = False
-                self.dispatcher.halted = False
+                self.dispatcher.end_script()
                 return OpResult(ok=False, req_id=req_id,
                                 error=f"cannot start script: {ex}")
             self._running = True
@@ -638,9 +732,20 @@ class ScriptRunner:
     def _read_output(self, proc: subprocess.Popen, job: int) -> None:
         try:
             if proc.stdout is not None:
-                for line in proc.stdout:
+                for raw_line in proc.stdout:
+                    line = raw_line.rstrip("\n")
                     with self._lock:
-                        self._lines.append(line.rstrip("\n"))
+                        stored = line
+                        if len(stored) > self.OUTPUT_TAIL_BYTES:
+                            stored = stored[-self.OUTPUT_TAIL_BYTES:]
+                            self._truncated = True
+                        self._lines.append(stored)
+                        self._bytes += len(stored) + 1
+                        self._trim()
+                    if self.echo_console:
+                        # --console: mirror the job's output on the Pi's
+                        # terminal (full lines, not just the GUI tail).
+                        print(line, flush=True)
             proc.wait()
         finally:
             with self._lock:
@@ -649,9 +754,47 @@ class ScriptRunner:
                 if self._proc is proc:
                     self._exit = proc.returncode
                     self._running = False
-                    self.dispatcher.halted = False
+                    self.dispatcher.end_script()
             print(f"script: job {job} exited with code {proc.returncode}",
                   flush=True)
+
+    def _trim(self) -> None:
+        """Keep the tail inside the line/byte budget (caller holds the lock).
+
+        Reserves room for the truncation marker so the advertised limits hold
+        for GET /state as a whole. The newest line is always kept, even when a
+        single line alone exceeds the byte budget.
+        """
+        line_limit = self.OUTPUT_TAIL_LINES - 1          # + marker line
+        byte_limit = (self.OUTPUT_TAIL_BYTES
+                      - len(self.TRUNCATION_MARKER) - 8)  # + marker bytes
+        while self._lines and (
+            len(self._lines) > line_limit or self._bytes > byte_limit
+        ):
+            if len(self._lines) == 1:
+                break  # never drop the line we just appended
+            dropped = self._lines.popleft()
+            self._bytes -= len(dropped) + 1
+            self._truncated = True
+        if self._bytes < 0:          # defensive: counters must never drift
+            self._bytes = 0
+
+    @staticmethod
+    def _signal_tree(proc: subprocess.Popen, *, force: bool = False) -> None:
+        """Signal the whole job tree; fall back to the direct child."""
+        if os.name == "posix":
+            sig = signal.SIGKILL if force else signal.SIGTERM
+            try:
+                os.killpg(proc.pid, sig)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
+        if force:
+            proc.kill()
+        else:
+            proc.terminate()
 
     def stop(self) -> OpResult:
         """Terminate the running job (SIGTERM, then SIGKILL after 2 s)."""
@@ -660,22 +803,25 @@ class ScriptRunner:
             running = self._running
         if proc is None or not running:
             return OpResult(ok=False, error="no script is running")
-        proc.terminate()
+        self._signal_tree(proc)
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            self._signal_tree(proc, force=True)
             proc.wait()
         return OpResult(ok=True)
 
     def status(self) -> protocol.ScriptStatus:
         with self._lock:
+            lines = list(self._lines)
+            if self._truncated:
+                lines.insert(0, self.TRUNCATION_MARKER)
             return protocol.ScriptStatus(
                 enabled=self.enabled,
                 running=self._running,
                 job=self._job,
                 exit=self._exit,
-                output="\n".join(self._lines),
+                output="\n".join(lines),
             )
 
 
@@ -823,7 +969,9 @@ def main(argv: list[str] | None = None) -> int:
                "                                       # scripts (source echoed\n"
                "                                       # to the console)\n"
                "  python3 pi.py --allow-code           # Pi: scripts allowed,\n"
-               "                                       # no source echo\n")
+               "                                       # no source echo\n"
+               "  python3 pi.py --allow-code --console # ...and print the script's\n"
+               "                                       # output on this terminal\n")
     parser.add_argument("--host", default="0.0.0.0",
                         help="bind address (default: all interfaces)")
     parser.add_argument("--port", type=int, default=protocol.DEFAULT_PORT,
@@ -832,9 +980,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="mock pins + synthetic sensor values (no Pi hardware)")
     parser.add_argument("--allow-code", action="store_true",
                         help="allow the GUI to run Python scripts on this machine "
-                             "(POST /script; off by default; with --dev the "
-                             "script source is echoed to the console)")
+                             "(POST /script; off by default). With --dev the "
+                             "received source is echoed to this console; add "
+                             "--console to echo the script's output as well")
+    parser.add_argument("--console", action="store_true",
+                        help="echo the script's stdout+stderr on this terminal "
+                             "while it runs (use with --allow-code)")
     args = parser.parse_args(argv)
+    _quiet_gpiozero_fallbacks()  # before any gpiozero device is built
 
     if args.dev:
         # Must be set before the first device construction (the pin factory
@@ -887,7 +1040,8 @@ def main(argv: list[str] | None = None) -> int:
 
     dispatcher = Dispatcher(dev=args.dev)
     runner = ScriptRunner(dispatcher, enabled=args.allow_code,
-                          echo_code=args.dev and args.allow_code)
+                          echo_code=args.dev and args.allow_code,
+                          echo_console=args.console)
     dispatcher.script = runner
     handler = type("BoundHandler", (_Handler,),
                    {"dispatcher": dispatcher, "runner": runner})
@@ -904,15 +1058,36 @@ def main(argv: list[str] | None = None) -> int:
         mode = f"live GPIO via {factory.__name__}"
     if args.allow_code:
         mode += ", script execution ALLOWED (--allow-code)"
+        if args.console:
+            mode += ", script output echoed here (--console)"
     else:
         mode += ", script execution disabled"
+    if (not args.dev and not _spidev_available()
+            and any(p.driver == "LDR" for p in pins.PROFILE.values())):
+        print("pi.py: Light (ADC): spidev is not installed — gpiozero will "
+              "bit-bang SPI (slower). For hardware SPI0: pip install spidev "
+              "and enable SPI in sudo raspi-config", file=sys.stderr, flush=True)
     print(f"picontrol bridge listening on {args.host}:{args.port} [{mode}]",
           flush=True)
+    # systemd stop / kill sends SIGTERM: take the same cleanup path as Ctrl-C
+    # so the running script's process tree and the GPIO are not left behind.
+    def _on_sigterm(signum, frame):  # noqa: ARG001 — signal handler signature
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError, AttributeError):
+        pass  # not the main thread / platform without SIGTERM
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\npi.py: shutting down", flush=True)
     finally:
+        # Stop a running script (and its children) BEFORE releasing GPIO:
+        # all_off() rebuilds devices, which the child may still own.
+        if runner.stop().ok:
+            print("pi.py: stopped the running script", flush=True)
         turned_off = dispatcher.all_off()  # leave the hardware quiet
         if turned_off:
             print(f"pi.py: switched off {turned_off} output(s)", flush=True)

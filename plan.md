@@ -32,7 +32,7 @@ Remote control of a Raspberry Pi's GPIO from a PC/laptop:
 | Sensor reads | **Poll on demand** — GUI polls every 1–2 s; no push channel in v1. |
 | Pin list | **Shared pin profile** — one module drives *both* `pi.py` validation and GUI layout, so they cannot drift. |
 | Devices planned | All four roles: outputs (LED/relay/buzzer), inputs (button/PIR), sensors (temp/distance/light), PWM (dimmer/motor). |
-| Light sensor | **Deferred** — needs an ADC (MCP3008/ADS1115); profile entry marked `needs_adc=True`, rendered disabled. |
+| Light sensor | **Implemented via an MCP3008 ADC** on SPI0 (`MCP3008(channel=0)`); the profile entry is a sentinel BCM (`-1`) and `needs_adc` stays `False`. `needs_adc=True` remains for a future analog pin with no ADC fitted (rendered disabled). |
 | Board visualization | **Hybrid**: image-2 pinout cell design (function-family colors, physical # + BCM + alt-function) arranged image-1 style as a **2×20 horizontal strip** — the reference diagram rotated 90° clockwise: its left column (1,3…39) is the top row and its right column (2,4…40) the second row, pins 1/2 at the right end — plus live state overlay. Generated from the header table — never transcribed (image 1 had pins 12/14 swapped). |
 | External emulator (nosix/raspberry-gpio-emulator) | **Not a dependency.** Abandoned py3.5-era code, separate Tk window, can't emulate timing-based sensors anyway. Optional later spike: `pi.py --dev-pins=emulator` + `GPIOZERO_PIN_FACTORY=rpigpio`. Mock pins + our own Board panel cover it. |
 | Pi webserver | **stdlib `http.server`** (`ThreadingHTTPServer`), ~50 lines. No pip-installable framework anywhere on the Pi; gpiozero is the only third-party import. Flet's internal server ruled out (no custom-route API). |
@@ -153,14 +153,21 @@ with `400 {"ok": false, …}`; the GUI never builds a control that would fail.
   exception: the DHT22 temperature sensor — gpiozero has **no DHT driver** (gpiozero issue
   #254 is still open), so `pi.py` uses `gpiozero.DHT22` if a build ever ships one, else the
   Adafruit CircuitPython driver **only when installed** (`pip install
-  adafruit-circuitpython-dht`); with neither present the card shows a clear fault instead
-  of an AttributeError. Both imports are lazy, so they are listed in the boundary allowlist.
+  adafruit-circuitpython-dht`, which installs the `adafruit_dht` module; built with
+  `use_pulseio=False` and released with `exit()`); with neither present the card shows a
+  clear fault instead of an AttributeError. Both imports are lazy, so they are listed in
+  the boundary allowlist.
 - Console view: one line per transaction, e.g.
   `12:01:04 #42 → digital_write 17 = 1    ← ok`.
-- CLI: `python3 pi.py --port 8642 [--dev] [--host 0.0.0.0]`.
+- Script jobs (`--allow-code`): the child's merged stdout+stderr is captured by the bridge
+  (so it does **not** appear on the Pi console unless `--console` is given) and returned with
+  `GET /state` as a tail of the last 200 lines / 16 KiB; when older output is dropped the tail
+  starts with `… earlier output truncated …`. A script run directly from a shell prints to
+  that shell.
+- CLI: `python3 pi.py --port 8642 [--dev] [--allow-code [--console]] [--host 0.0.0.0]`.
 - Modes:
   - default — real pins (lgpio/RPi.GPIO as provided by Raspberry Pi OS),
-  - `--dev` — sets `GPIOZERO_MOCK_PIN_FACTORY` before gpiozero import, plus synthetic sensor
+  - `--dev` — sets `GPIOZERO_PIN_FACTORY=mock` before gpiozero import, plus synthetic sensor
     values (DHT/HC-SR04 can't be timing-emulated) so the GUI is fully developable on the PC,
   - `--dev` also whitelists a `set_input` op so clicking an input cell on the Board strip
     simulates a button press (the one useful idea from the nosix emulator, ~20 lines).
@@ -172,9 +179,17 @@ no `src.` prefixes, so imports (`import pins`) resolve identically on both machi
 
 ```
 copy to Pi:  src/pi.py  src/pins.py  src/protocol.py   → any folder, e.g. ~/picontrol/
-run:         pip install gpiozero        # or: apt install python3-gpiozero (brings lgpio)
+run:         pip install "gpiozero==1.6.2" "setuptools<81"   # or: apt install python3-gpiozero
              python3 pi.py --port 8642
 ```
+
+Target Pi environment: **Python 3.11 + gpiozero 1.6.2** (RPi.GPIO backend). Pin the version:
+unpinned, pip now installs gpiozero 2.x, which resolves pin factories differently. gpiozero
+1.6.x also imports `pkg_resources` for its mock pins, so `setuptools<81` must stay installed
+for `--dev` and the test suite. One teardown quirk to know about: 1.6.x's
+`DistanceSensor.close()` sets `_trigger = None` *before* stopping its sampler thread, so a
+read in flight dies with `AttributeError: 'NoneType' object has no attribute 'pin'`; the
+dispatcher stops the sampler thread first (`_queue.stop()`) and then closes the device.
 
 `main.py` (Flet) never ships to the Pi; the Pi set never imports flet. **The copy set is
 self-contained by test**: a deploy-smoke test copies exactly those 3 files into a temp dir
@@ -224,12 +239,16 @@ hooks: `page.on_resize` delivers `width`/`height` (logical px), and
 `page.set_allowed_device_orientations([DeviceOrientation.PORTRAIT_UP])` locks orientation
 on mobile — it **raises on desktop**, so call it only when `page.platform` is android/ios.
 
-- **One breakpoint**: `width < 600` = narrow mode; re-render sections on `on_resize`.
-- **Narrow layout**: the Board strip switches to the **vertical pinout** (20 rows × 2 cols,
-  labels beside cells — the pinout.xyz style fits portrait naturally); wide screens keep
-  the 2×20 horizontal strip (reference rotated 90° CW: odd pins top, even below, 1/2 at
-  the right end). Control sections drop to a single GridView column, the
-  connection bar wraps, touch targets ≥ 44 px.
+- **One breakpoint**: `width < 600` = narrow mode; re-render the shell on `on_resize`.
+- **Narrow layout**: navigation moves to a bottom `NavigationBar` with three pages —
+  **Board | Control | Script**; the Board page shows the full **vertical pinout**
+  (20 rows × 2 cols, labels beside cells — the pinout.xyz style fits portrait naturally)
+  with maximum detail per pin (physical #, BCM, alt function, family, wired device, live
+  state, fault). Control starts directly with the device cards (no 1000 px board above
+  them) and Script has the whole page for editor + console.
+- **Wide layout**: a fixed header, the compact **2×20 board strip pinned** above the paged
+  area (so the whole header stays visible while scrolling), and `Tabs` for
+  **Board | Control | Script**. The Board tab is the same detailed view as the phone page.
 - **Install routes** (either way the phone reaches `pi.py`'s host:port over the same WiFi):
   1. **Native APK** — `flet build apk -v` (documented in README); needs Android SDK + JDK
      on the PC. HTTP runs from Python, not a browser → no CORS concerns.
@@ -237,24 +256,29 @@ on mobile — it **raises on desktop**, so call it only when `page.platform` is 
      client → `pi.py` must answer CORS (see §4); also keep everything plain http to avoid
      https→http mixed-content blocking.
 
-Layout, top → bottom:
+App shell (the shell never scrolls; only the selected page does):
 
 ```
-Connection bar   host:port field + quick-targets dropdown (localhost / Pi),
-                   Connect, status dot, last-poll latency
-BOARD            2×20 horizontal strip (collapsible toggle)
-                   ring color = function family (pinout.xyz palette)
-                   fill/badge = live state: OUT=0 blue, OUT=1 green, IN=1 flash,
-                                PWM 60%, 21.3°, power/GND/ID inert
-                   click a claimed OUTPUT cell = toggle (same op path as its card)
-Outputs          GridView of Switch cards        (LEDs, relays)
-Momentary         press-and-hold buttons          (buzzer)
-Inputs           read-only indicators            (buttons, PIR) — polled
-Sensors          value cards with units          (°C, m; lx disabled: needs_adc)
-PWM              sliders, send on on_change_end   (one op per drag, not 60)
-Activity log     last ~20 ops, JSON in/out, errors red
-                 "All OFF" button in Outputs header
+Header (fixed)   "picontrol" · host:port field · quick-targets popup · Connect ·
+                 status chip (dot + "connected · 12 ms" / "can't reach the Pi")
+Navigation       wide: Tabs (Board | Control | Script) under the pinned strip
+                 narrow: NavigationBar at the bottom
+Board page       every pin as a detail card: #physical, name, BCM, alt function,
+                 family colour+label, wired device, live state chip, fault text,
+                 legend, "wired only" filter; tap a wired output = toggle
+Control page     Controls grid  (LEDs, relays, RGB swatches, buzzer pulse+tones,
+                                 dimmer/motor sliders; "ALL OFF" in the heading)
+                 Monitoring      (input indicators + sensor value cards)
+                 Activity        (last 16 ops, collapsible, clearable)
+Script page      status chip · Run / Stop · Clear / Indent / Outdent / Examples,
+                 editor (monospace) and console (stdout+stderr tail) side by side
+                 on wide screens, stacked on narrow ones
 ```
+
+Type scale (deliberately generous — read at arm's length, often on a phone):
+12 px pin numbers/meta, 13 px subtitles and log, 15 px body, 17 px card titles,
+20 px section headings, 28 px sensor values, 14 px script editor, 13 px console.
+Minimum contrast for secondary text is `#52606D` on white (was `#78909C`).
 
 Controller behaviours:
 
@@ -302,7 +326,8 @@ Controller behaviours:
 7. ✅ E2E smoke: `src/pi.py --dev` booted as a process and driven over HTTP with
    every op (incl. structured errors + CORS) — console log verified. Remaining:
    manual `uv run flet run` look and a real-Pi run.
-8. ✅ `pyproject.toml`: gpiozero in the dev group.
+8. ✅ `pyproject.toml`: gpiozero in the dev group (2.x for `uv run pytest`; the Pi
+   target 1.6.2 is exercised with a separate 3.11/1.6.2 environment — see AGENTS.md).
 
 ## 9. Out of scope (v1)
 

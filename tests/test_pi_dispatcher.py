@@ -6,10 +6,16 @@ ephemeral port and drives it with urllib, exercising the full Pi side.
 
 from __future__ import annotations
 
+import os
+import socket
+import subprocess
+import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
+import warnings
 from http.server import ThreadingHTTPServer
 
 import gpiozero
@@ -262,6 +268,51 @@ def test_dht22_without_a_driver_is_a_clear_fault(capsys):
         device.close()
 
 
+def test_dht22_uses_the_adafruit_driver(monkeypatch):
+    """The pip package is adafruit-circuitpython-dht but the module it
+    installs is adafruit_dht. Build with use_pulseio=False (Linux SBCs) and
+    release through exit(): Adafruit's driver has no close()."""
+    seen: dict = {}
+
+    class FakeDHT22:
+        def __init__(self, pin, use_pulseio=True):
+            seen["pin"] = pin
+            seen["use_pulseio"] = use_pulseio
+
+        def exit(self):  # Adafruit's cleanup method
+            seen["exited"] = True
+
+    fake_board = types.ModuleType("board")
+    fake_board.D4 = "board-pin-D4"
+    fake_dht = types.ModuleType("adafruit_dht")
+    fake_dht.DHT22 = FakeDHT22
+    monkeypatch.setitem(sys.modules, "board", fake_board)
+    monkeypatch.setitem(sys.modules, "adafruit_dht", fake_dht)
+    monkeypatch.delattr(gpiozero, "DHT22", raising=False)
+
+    real = pi.Dispatcher(dev=False)  # dev mode never builds the driver
+    dev = real._device(pins.PROFILE[4])
+    assert isinstance(dev, FakeDHT22)
+    assert seen == {"pin": "board-pin-D4", "use_pulseio": False}
+
+    assert real.release_all() == 1
+    assert seen["exited"] is True
+
+
+def test_light_sensor_is_the_adc_not_a_gpio_ldr():
+    """Light (ADC) is the MCP3008 itself: it already exposes .value (0..1).
+    LightSensor() is the capacitor-timed class for a digital GPIO pin and
+    raises AttributeError when handed an analog device."""
+    real = pi.Dispatcher(dev=False)
+    try:
+        dev = real._device(pins.PROFILE[-1])
+        assert isinstance(dev, gpiozero.MCP3008)
+        assert dev.channel == 0
+        assert 0.0 <= float(dev.value) <= 1.0
+    finally:
+        real.release_all()
+
+
 def test_distance_read_never_blocks(dsp):
     """partial=True on DistanceSensor: an unwired HC-SR04 (echo never fires)
     must not hang GET /state — gpiozero's default waits for a full sample
@@ -454,6 +505,7 @@ def test_script_runs_and_captures_output(dsp):
     status = _finish(r)
     assert status.exit == 0
     assert "hello from the script" in status.output
+    assert not status.output.startswith(pi.ScriptRunner.TRUNCATION_MARKER)
     assert dsp.halted is False  # GPIO released again after the job
 
 
@@ -513,6 +565,28 @@ def test_script_source_not_echoed_without_dev_flag(dsp, capsys):
     assert "source" not in out
 
 
+def test_console_flag_echoes_the_script_output(dsp, capsys):
+    """--console: the Pi terminal also shows what the script prints (the GUI
+    still gets the bounded tail via GET /state)."""
+    r = pi.ScriptRunner(dsp, enabled=True, echo_console=True)
+    dsp.script = r
+    assert r.start("print('echoed on the pi console')").ok
+    status = _finish(r)
+    out = capsys.readouterr().out
+    assert "echoed on the pi console" in out
+    assert "echoed on the pi console" in status.output
+
+
+def test_console_echo_is_off_by_default(dsp, capsys):
+    r = pi.ScriptRunner(dsp, enabled=True)
+    dsp.script = r
+    assert r.start("print('gui only')").ok
+    status = _finish(r)
+    out = capsys.readouterr().out
+    assert "gui only" not in out          # console stays clean
+    assert "gui only" in status.output    # ...but the GUI tail has it
+
+
 def test_script_halts_pin_ops_while_running(dsp):
     r = pi.ScriptRunner(dsp, enabled=True)
     dsp.script = r
@@ -559,6 +633,90 @@ def test_start_releases_cached_devices(dsp):
     assert r.start("print('hi')").ok
     assert 17 not in dsp._devices
     _finish(r)
+
+
+def test_stop_kills_the_whole_process_tree(dsp, tmp_path):
+    """Stop must reach grandchildren too (process group). A survivor keeps the
+    merged output pipe open — the reader thread never finalizes the job — and
+    keeps holding the GPIO the bridge is about to reclaim."""
+    if os.name != "posix":
+        pytest.skip("process groups are POSIX-only")
+    beat = tmp_path / "beat"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import pathlib, time\n"
+        f"beat = pathlib.Path({str(beat)!r})\n"
+        "while True:\n"
+        "    beat.write_text(str(time.time()))\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    r = pi.ScriptRunner(dsp, enabled=True)
+    dsp.script = r
+    code = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(child)!r}])\n"
+        "while True:\n"
+        "    time.sleep(0.05)\n"
+    )
+    assert r.start(code).ok
+    assert wait_for(beat.exists, timeout=10.0), "grandchild never started"
+    assert r.stop().ok
+    assert _finish(r).running is False, \
+        "output pipe stayed open — the grandchild survived stop"
+    first = beat.read_text()
+    time.sleep(0.4)
+    assert beat.read_text() == first, "grandchild still running after stop"
+
+
+def test_release_all_stops_samplers_before_close(dsp):
+    """gpiozero 1.6.x DistanceSensor.close() clears _trigger before stopping
+    its sampling thread; a sample racing the close dies with
+    `AttributeError: 'NoneType' object has no attribute 'pin'`. The dispatcher
+    must stop the sampler first (verified by ordering here)."""
+    events: list[str] = []
+
+    class FakeQueue:
+        def stop(self) -> None:
+            events.append("queue.stop")
+
+    class FakeSensor:
+        _queue = FakeQueue()
+
+        def close(self) -> None:
+            events.append("close")
+
+    dsp._devices[99] = FakeSensor()
+    assert dsp.release_all() == 1
+    assert events == ["queue.stop", "close"]
+
+
+def test_script_output_marks_truncation(dsp):
+    """When the tail drops old lines the GUI must say so instead of silently
+    presenting a partial log as the whole log."""
+    r = pi.ScriptRunner(dsp, enabled=True)
+    dsp.script = r
+    assert r.start("for i in range(600): print(i)").ok
+    status = _finish(r)
+    lines = status.output.split("\n")
+    assert lines[0] == pi.ScriptRunner.TRUNCATION_MARKER
+    assert lines[-1] == "599"          # newest line always survives
+    assert len(lines) <= pi.ScriptRunner.OUTPUT_TAIL_LINES
+
+
+def test_script_output_tail_is_bounded(dsp):
+    """A chatty script must not make GET /state unbounded: keep at most 200
+    lines and 16 KiB (a single huge line is truncated, not discarded)."""
+    r = pi.ScriptRunner(dsp, enabled=True)
+    dsp.script = r
+    assert r.start("for i in range(500): print(i)\n"
+                   "print('x' * 40000)").ok
+    status = _finish(r)
+    lines = status.output.split("\n")
+    assert len(lines) <= pi.ScriptRunner.OUTPUT_TAIL_LINES
+    assert len(status.output) <= pi.ScriptRunner.OUTPUT_TAIL_BYTES + 200
+    assert len(lines[-1]) == pi.ScriptRunner.OUTPUT_TAIL_BYTES
+    assert set(lines[-1]) == {"x"}
 
 
 def test_all_off_stops_running_script(dsp):
@@ -635,6 +793,63 @@ def test_http_script_garbage_is_400(http_bridge):
     assert not parse_result(body).ok
 
 
+def test_sigterm_shutdown_stops_the_running_job():
+    """`kill`/systemd stop must behave like Ctrl-C: stop the job tree, then
+    release the GPIO. Run the real `pi.py` process to cover main()'s cleanup."""
+    if os.name != "posix":
+        pytest.skip("POSIX signals only")
+
+    with socket.socket() as probe:           # ask the OS for a free port
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    env = os.environ.copy()
+    env["GPIOZERO_PIN_FACTORY"] = "mock"
+    env["GPIOZERO_MOCK_PIN_CLASS"] = "mockpwmpin"
+    proc = subprocess.Popen(
+        [sys.executable, str(pi.__file__),
+         "--dev", "--allow-code", "--host", "127.0.0.1", "--port", str(port)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, env=env,
+    )
+    base = f"http://127.0.0.1:{port}"
+    try:
+        assert wait_for(lambda: _state_ok(base), timeout=20.0), \
+            "pi.py --dev never answered GET /state"
+        assert _post_path(base, "/script", protocol.encode_script(
+            "import time\ntime.sleep(60)\n"))[0] == 200
+        assert wait_for(lambda: _script_running(base), timeout=15.0), \
+            "the job never started"
+        proc.terminate()
+        out, _ = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+    assert proc.returncode == 0, out
+    assert "shutting down" in out
+    assert "stopped the running script" in out
+    # order matters: the child must be gone before the GPIO is reclaimed
+    assert out.index("stopped the running script") < out.index("switched off")
+
+
+def _state_ok(base: str) -> bool:
+    try:
+        with urllib.request.urlopen(base + "/state", timeout=1) as resp:
+            return resp.status == 200
+    except OSError:
+        return False
+
+
+def _script_running(base: str) -> bool:
+    try:
+        with urllib.request.urlopen(base + "/state", timeout=1) as resp:
+            return protocol.parse_script_status(resp.read()).running
+    except (OSError, protocol.ProtocolError):
+        return False
+
+
 # ------------------------------------------------- startup failure modes ----
 
 def test_help_prints_all_flags_and_exits_zero(capsys):
@@ -643,7 +858,7 @@ def test_help_prints_all_flags_and_exits_zero(capsys):
         pi.main(["--help"])
     assert exc.value.code == 0
     out = capsys.readouterr().out
-    for flag in ("--host", "--port", "--dev", "--allow-code"):
+    for flag in ("--host", "--port", "--dev", "--allow-code", "--console"):
         assert flag in out
 
 
@@ -651,11 +866,16 @@ def test_live_mode_fails_fast_without_pin_factory(monkeypatch, capsys):
     """A PC started without --dev must exit with a hint, not serve and
     explode later on the first device construction."""
 
-    def _boom():
+    def _boom(*args, **kwargs):
         raise RuntimeError("Unable to load any default pin factory!")
 
-    monkeypatch.setattr(gpiozero.Device, "ensure_pin_factory",
-                        staticmethod(_boom))
+    # 2.x resolves through Device.ensure_pin_factory(); 1.6.x through
+    # Device._default_pin_factory(). Break whichever one this gpiozero has.
+    if hasattr(gpiozero.Device, "ensure_pin_factory"):
+        monkeypatch.setattr(gpiozero.Device, "ensure_pin_factory",
+                            staticmethod(_boom))
+    else:
+        monkeypatch.setattr(gpiozero.Device, "_default_pin_factory", _boom)
     assert pi.main(["--port", "0"]) == 1
     err = capsys.readouterr().err
     assert "no usable GPIO pin factory" in err
@@ -677,7 +897,8 @@ def test_pin_factory_resolution_falls_back_on_gpiozero_1_6(monkeypatch):
     """1.6.x has no Device.ensure_pin_factory(); resolution must fall back to
     Device._default_pin_factory() and cache it like Device.__init__ does."""
 
-    monkeypatch.delattr(gpiozero.Device, "ensure_pin_factory")
+    if hasattr(gpiozero.Device, "ensure_pin_factory"):
+        monkeypatch.delattr(gpiozero.Device, "ensure_pin_factory")
     monkeypatch.setattr(gpiozero.Device, "pin_factory", None)
 
     factory = pi._resolve_pin_factory()
@@ -689,7 +910,8 @@ def test_pin_factory_resolution_falls_back_on_gpiozero_1_6(monkeypatch):
 def test_live_mode_refuses_mock_on_gpiozero_1_6(monkeypatch, capsys):
     """Same refusal as on 2.x, reached through the 1.6.x resolution path."""
 
-    monkeypatch.delattr(gpiozero.Device, "ensure_pin_factory")
+    if hasattr(gpiozero.Device, "ensure_pin_factory"):
+        monkeypatch.delattr(gpiozero.Device, "ensure_pin_factory")
 
     assert pi.main(["--port", "0"]) == 1
     err = capsys.readouterr().err
@@ -710,6 +932,17 @@ def test_missing_setuptools_gets_its_own_hint(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "pkg_resources" in err
     assert 'pip install "setuptools<81"' in err
+
+
+def test_software_spi_fallback_warning_is_quieted():
+    """gpiozero warns loudly when it bit-bangs SPI (no spidev). That warning
+    would interleave with transaction lines and --console script output, so
+    the bridge replaces it with one plain startup hint."""
+    pi._quiet_gpiozero_fallbacks()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.warn("failed to initialize hardware SPI, falling back to "
+                      "software (error was: failed to import spidev)")
+    assert caught == []
 
 
 def test_all_off_reports_one_line_per_failure(dsp, monkeypatch, capsys):

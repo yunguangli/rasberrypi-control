@@ -9,5 +9,5 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("GPIOZERO_PIN_FACTORY", "mock")
-os.environ.setdefault("GPIOZERO_MOCK_PIN_CLASS", "mockpwmpin")
+os.environ["GPIOZERO_PIN_FACTORY"] = "mock"
+os.environ["GPIOZERO_MOCK_PIN_CLASS"] = "mockpwmpin"
