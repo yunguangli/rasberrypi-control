@@ -6,14 +6,14 @@ flet (boundary enforced by tests/test_import_boundary.py):
   PiClient — model/transport: blocking stdlib HTTP against pi.py. The
              controller wraps every call in asyncio.to_thread.
   App      — controller: poll loop, optimistic updates, activity log,
-             responsive navigation, portrait lock.
-  _render* — view: three pages generated from pins.HEADER / pins.PROFILE
+             responsive navigation, portrait lock, Agent page.
+  _render* — view: four pages generated from pins.HEADER / pins.PROFILE
              (so adding a device to pins.py adds its card automatically).
 
 Layout (app shell):
 
   [ fixed header: target + connection status ]
-  [ Board | Control | Script ]   wide: Tabs  ·  narrow: NavigationBar
+  [ Board | Control | Script | Agent ]   wide: Tabs  ·  narrow: NavigationBar
   [ the selected page scrolls; the shell itself never does ]
 
 Wide screens pin a compact 2x20 Board strip above the tabs; the Board page
@@ -24,14 +24,19 @@ live state) on every screen size.
 from __future__ import annotations
 
 import asyncio
+import os
+import queue
+import threading
 import time
 import urllib.error
 import urllib.request
 
 import flet as ft
 
+import agent as agent_mod
 import pins
 import protocol
+from agent import AgentEvent, Settings as AgentSettings
 from pins import FunctionColor, PinProfile, Role
 from protocol import Op, OpResult, PinState, ScriptStatus
 
@@ -42,6 +47,14 @@ REQUEST_TIMEOUT = 3.0            # per-request urllib timeout
 LOG_LINES = 16                   # activity log depth
 PULSE_MS = 300                   # click-to-pulse duration for the buzzer
 SCRIPT_INDENT = 4                # spaces per Tab press in the script box
+AGENT_ROWS = 40                  # transcript rows kept
+AGENT_DRAIN_SECONDS = 0.05       # UI refresh while a turn is running
+AGENT_WIRE_LINES = 40            # raw op/reply lines kept in the wire panel
+
+# Model settings live next to the user's other config, never in the repo.
+AGENT_SETTINGS_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "picontrol", "agent.json")
 
 # ---------------------------------------------------------------- type scale --
 # Sizes are deliberately generous: the GUI is read at arm's length, often on a
@@ -73,6 +86,7 @@ DANGER_BG = "#FFEBEE"
 IDLE_BG = "#ECEFF1"
 CONSOLE_BG = "#101820"
 CONSOLE_FG = "#D6E2EC"
+CONSOLE_MUTED = "#8FA3B3"
 
 # Quick-pick targets for the popup under the host field: this machine
 # (where `pi.py --dev` runs) and the Pi on the LAN.
@@ -310,6 +324,22 @@ class PiClient:
             return None, None, f"{type(ex).__name__}: {ex}"
 
 
+class _PendingQuestion:
+    """A question the agent is blocked on, resolved from the UI thread."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self.answer: str | None = None
+
+    def resolve(self, answer: str | None) -> None:
+        self.answer = answer
+        self._event.set()
+
+    def wait(self, timeout: float) -> str | None:
+        self._event.wait(timeout)
+        return self.answer
+
+
 class App:
     """Controller + view builder for the picontrol GUI."""
 
@@ -317,6 +347,7 @@ class App:
     PAGE_BOARD = 0
     PAGE_CONTROL = 1
     PAGE_SCRIPT = 2
+    PAGE_AGENT = 3
 
     def __init__(self, page: ft.Page) -> None:
         self.page = page
@@ -343,6 +374,24 @@ class App:
         self.log: list[tuple[str, bool]] = []
         # Set when the window/tab goes away: stop polling, ignore UI calls.
         self._session_lost = False
+
+        # --- Agent page ---------------------------------------------------
+        self.agent_settings = AgentSettings.load(AGENT_SETTINGS_PATH)
+        if not self.agent_settings.facts_path:
+            # Persist learned aliases next to the settings by default; the
+            # settings dialog can point at another file.
+            self.agent_settings.facts_path = os.path.join(
+                os.path.dirname(AGENT_SETTINGS_PATH), "facts.json")
+        self.agent: agent_mod.Agent | None = None
+        self._active_agent: agent_mod.Agent | None = None
+        self.agent_busy = False
+        self.agent_events: queue.Queue = queue.Queue()
+        self.agent_rows: list[dict] = []
+        self.pending_question: _PendingQuestion | None = None
+        self._stop_requested = False
+        # Exact POST /op bodies + replies produced by the agent.
+        self.agent_wire: list[str] = []
+        self.agent_wire_open = False
 
         # app shell (rebuilt on every _render)
         self.shell: ft.Column | None = None
@@ -380,6 +429,19 @@ class App:
         self.script_status: ft.Text | None = None
         self.console_text: ft.Text | None = None
         self.console: ft.Column | None = None
+        # Agent page refs
+        self.agent_list: ft.ListView | None = None
+        self.agent_prompt: ft.TextField | None = None
+        self.agent_send: ft.IconButton | None = None
+        self.agent_stop: ft.Button | None = None
+        self.agent_status: ft.Text | None = None
+        self.agent_state: ft.Text | None = None
+        self.agent_devices: ft.Column | None = None
+        self.agent_clear: ft.IconButton | None = None
+        self.agent_wire_toggle: ft.IconButton | None = None
+        self.agent_wire_panel: ft.Container | None = None
+        self.agent_wire_text: ft.Text | None = None
+        self.agent_wire_box: ft.Column | None = None
 
     # ------------------------------------------------------------ lifecycle --
 
@@ -433,9 +495,9 @@ class App:
         if narrow == self.narrow:
             return
         self.narrow = narrow
-        # Both form factors have the same three pages — keep the user on the
-        # page they were looking at (only the navigation widget changes).
-        self.page_index = max(0, min(self.page_index, self.PAGE_SCRIPT))
+        # Both form factors have the same pages — keep the user on the page
+        # they were looking at (only the navigation widget changes).
+        self.page_index = max(0, min(self.page_index, self.PAGE_AGENT))
         self._render()
 
     # -------------------------------------------------------------- shell ----
@@ -466,6 +528,7 @@ class App:
             self.PAGE_BOARD: self._board_page(),
             self.PAGE_CONTROL: self._control_page(),
             self.PAGE_SCRIPT: self._script_page(),
+            self.PAGE_AGENT: self._agent_page(),
         }
 
         header = self._header()
@@ -489,12 +552,15 @@ class App:
                     ft.NavigationBarDestination(
                         icon=ft.Icons.TERMINAL, label="Script",
                         key="nav-script"),
+                    ft.NavigationBarDestination(
+                        icon=ft.Icons.AUTO_AWESOME, label="Agent",
+                        key="nav-agent"),
                 ],
             )
             controls = [header, self.body, self.nav]
         else:
             self.tabs = ft.Tabs(
-                length=3,
+                length=4,
                 selected_index=self.page_index,
                 expand=True,
                 on_change=self._on_tab_change,
@@ -509,6 +575,9 @@ class App:
                                        key="tab-control"),
                                 ft.Tab(label="Script", icon=ft.Icons.TERMINAL,
                                        key="tab-script"),
+                                ft.Tab(label="Agent",
+                                       icon=ft.Icons.AUTO_AWESOME,
+                                       key="tab-agent"),
                             ],
                         ),
                         ft.TabBarView(
@@ -517,6 +586,7 @@ class App:
                                 self.page_controls[self.PAGE_BOARD],
                                 self.page_controls[self.PAGE_CONTROL],
                                 self.page_controls[self.PAGE_SCRIPT],
+                                self.page_controls[self.PAGE_AGENT],
                             ],
                         ),
                     ],
@@ -690,6 +760,7 @@ class App:
         # and on whether a job is running), so refresh them here too — else
         # they stay enabled after the Pi becomes unreachable.
         self._apply_script()
+        self._apply_agent()
 
     # ------------------------------------------------------------ polling ----
 
@@ -744,6 +815,7 @@ class App:
         self._apply_states()
         self._apply_connection()
         self._apply_script()
+        self._apply_agent()
         self.page.update()
         self._scroll_console()
         return POLL_OK_SECONDS
@@ -1588,7 +1660,6 @@ class App:
         examples = ft.PopupMenuButton(
             key="script-example",
             content=ft.Text("Examples", size=FS_BODY),
-            icon=ft.Icons.CODE,
             tooltip="Insert an example",
             items=[
                 ft.PopupMenuItem(
@@ -1926,6 +1997,755 @@ class App:
             await self.console.scroll_to(offset=-1.0)
         except Exception:  # noqa: BLE001 — session closed / control gone
             pass
+
+    # -------------------------------------------------------------- agent ----
+
+    def _agent_page(self) -> ft.Control:
+        """Transcript + composer, with a device rail on wide screens."""
+        self.agent_status = ft.Text(
+            "", size=FS_STATUS, weight=ft.FontWeight.BOLD, color=TEXT_SUB,
+            expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+        self.agent_send = ft.IconButton(
+            icon=ft.Icons.SEND, key="agent-send", tooltip="Send",
+            icon_color="#FFFFFF", bgcolor=ACCENT,
+            on_click=lambda e: self.page.run_task(self._agent_send))
+        self.agent_stop = ft.Button(
+            content="Stop", key="agent-stop", icon=ft.Icons.STOP,
+            bgcolor=DANGER, color="#FFFFFF", height=40,
+            on_click=lambda e: self._agent_stop())
+        settings_btn = ft.IconButton(
+            icon=ft.Icons.SETTINGS, key="agent-settings",
+            tooltip="Model settings",
+            on_click=lambda e: self._open_agent_settings())
+        clear_btn = ft.IconButton(
+            icon=ft.Icons.CLEAR_ALL, key="agent-clear",
+            tooltip="Clear the transcript",
+            on_click=lambda e: self._clear_agent())
+        self.agent_clear = clear_btn
+        self.agent_wire_toggle = ft.IconButton(
+            icon=(ft.Icons.VISIBILITY_OFF if self.agent_wire_open
+                  else ft.Icons.CABLE),
+            selected=self.agent_wire_open,
+            key="agent-wire-toggle",
+            tooltip=("Hide Pi traffic" if self.agent_wire_open
+                     else "Show the exact ops sent to the Pi"),
+            on_click=lambda e: self._toggle_agent_wire())
+        self.agent_prompt = ft.TextField(
+            hint_text="Ask or command…  e.g. turn on the status LED",
+            expand=True,
+            text_style=ft.TextStyle(size=FS_BODY),
+            border=ft.OutlineInputBorder(border_radius=10),
+            key="agent-prompt",
+            on_submit=lambda e: self.page.run_task(self._agent_send),
+        )
+        self.agent_list = ft.ListView(
+            controls=self._agent_row_widgets(),
+            expand=True, spacing=8, padding=0, key="agent-transcript")
+        self.agent_state = ft.Text(
+            self._agent_state_text(), size=FS_SMALL, color=TEXT_SUB,
+            max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, key="agent-state")
+
+        # Raw wire log: the exact JSON body sent to POST /op and the reply.
+        # Hidden by default; the cable icon in the toolbar toggles it.
+        self.agent_wire_text = ft.Text(
+            "\n".join(self.agent_wire) or "(no agent traffic yet)",
+            size=FS_CONSOLE, font_family="monospace",
+            color=CONSOLE_FG if self.agent_wire else CONSOLE_MUTED,
+            selectable=True, key="agent-wire-text")
+        self.agent_wire_box = ft.Column(
+            controls=[self.agent_wire_text], scroll=ft.ScrollMode.AUTO,
+            expand=True)
+        self.agent_wire_panel = ft.Container(
+            content=ft.Column(controls=[
+                ft.Row(controls=[
+                    ft.Icon(ft.Icons.CABLE, size=14, color=TEXT_SUB),
+                    ft.Text("Agent → Pi", size=FS_TINY,
+                            weight=ft.FontWeight.BOLD, color=TEXT_SUB),
+                    ft.Text("exact POST /op JSON", size=FS_TINY,
+                            color=TEXT_FAINT, expand=True),
+                ], spacing=6),
+                ft.Container(
+                    content=self.agent_wire_box, height=120, padding=8,
+                    bgcolor=CONSOLE_BG, border_radius=8),
+            ], spacing=4),
+            visible=self.agent_wire_open,
+            key="agent-wire",
+        )
+
+        toolbar = ft.Row(
+            controls=[self.agent_status, self.agent_wire_toggle, settings_btn,
+                      clear_btn, self.agent_stop],
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        composer = ft.Row(
+            controls=[self.agent_prompt, self.agent_send],
+            spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        left = ft.Column(
+            controls=[
+                toolbar,
+                ft.Container(content=self.agent_list, expand=True),
+                self.agent_wire_panel,
+                self.agent_state,
+                composer,
+            ],
+            spacing=10, expand=True,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
+        if self.narrow:
+            return ft.Container(content=left, expand=True)
+        rail = ft.Container(
+            content=self._agent_devices_panel(), width=250, padding=12,
+            border_radius=14, bgcolor=CARD_BG,
+            border=ft.Border.all(1, CARD_BORDER),
+        )
+        return ft.Container(
+            content=ft.Row(controls=[left, rail], spacing=12, expand=True,
+                           vertical_alignment=ft.CrossAxisAlignment.STRETCH),
+            expand=True,
+        )
+
+    def _agent_row_widgets(self) -> list[ft.Control]:
+        if not self.agent_rows:
+            return [self._agent_empty_state()]
+        return [self._agent_row(row) for row in self.agent_rows]
+
+    def _agent_empty_state(self) -> ft.Control:
+        suggestions = [
+            "Turn on the Status LED",
+            "Blink the Status LED three times",
+            "What's the room temperature?",
+            "Turn everything off",
+        ]
+        return ft.Column(
+            controls=[
+                ft.Container(height=24),
+                ft.Icon(ft.Icons.AUTO_AWESOME, size=40, color=ACCENT),
+                ft.Text("Type a command for the board",
+                        size=FS_CARD_TITLE, weight=ft.FontWeight.BOLD,
+                        color=TEXT, text_align=ft.TextAlign.CENTER),
+                ft.Text("It becomes a GPIO action on the Pi — no code needed.",
+                        size=FS_SMALL, color=TEXT_SUB,
+                        text_align=ft.TextAlign.CENTER),
+                ft.Row(
+                    controls=[
+                        ft.Button(
+                            content=text, key=f"agent-suggest-{index}",
+                            on_click=lambda e, t=text: self._use_suggestion(t),
+                        )
+                        for index, text in enumerate(suggestions)
+                    ],
+                    wrap=True, spacing=8, run_spacing=8,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                ),
+            ],
+            spacing=10, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+    def _use_suggestion(self, text: str) -> None:
+        if self.agent_prompt is not None:
+            self.agent_prompt.value = text
+        self.page.run_task(self._agent_send)
+
+    def _agent_row(self, row: dict) -> ft.Control:
+        kind = row.get("kind", "assistant")
+        text = row.get("text", "")
+        if kind == "user":
+            return ft.Row(
+                controls=[ft.Container(
+                    content=ft.Text(text, size=FS_BODY, color=TEXT,
+                                    selectable=True),
+                    bgcolor="#E3F2FD", padding=10, border_radius=12)],
+                alignment=ft.MainAxisAlignment.END,
+            )
+        if kind == "assistant":
+            return ft.Row(
+                controls=[ft.Container(
+                    content=ft.Text(text, size=FS_BODY, color=TEXT,
+                                    selectable=True),
+                    bgcolor=CARD_BG, padding=10, border_radius=12,
+                    border=ft.Border.all(1, CARD_BORDER))],
+                alignment=ft.MainAxisAlignment.START,
+            )
+        if kind == "error":
+            return ft.Row(
+                controls=[ft.Container(
+                    content=ft.Row(controls=[
+                        ft.Icon(ft.Icons.ERROR_OUTLINE, size=16, color=DANGER),
+                        ft.Text(text, size=FS_SMALL, color=DANGER,
+                                selectable=True, expand=True),
+                    ], spacing=6),
+                    bgcolor=DANGER_BG, padding=10, border_radius=10)],
+                alignment=ft.MainAxisAlignment.START,
+            )
+        if kind == "script":
+            preview = "\n".join((row.get("code") or "").splitlines()[:4])
+            return ft.Container(
+                content=ft.Column(controls=[
+                    ft.Row(controls=[
+                        ft.Icon(ft.Icons.CODE, size=16, color=ACCENT),
+                        ft.Text(row.get("title") or "script ready",
+                                size=FS_SMALL, weight=ft.FontWeight.BOLD,
+                                color=TEXT, expand=True),
+                        ft.Button(
+                            content="Open in Script",
+                            icon=ft.Icons.OPEN_IN_NEW,
+                            key="agent-open-script",
+                            on_click=lambda e, r=row: self._open_script(
+                                r.get("code") or "")),
+                    ], spacing=6),
+                    ft.Text(preview, size=FS_CONSOLE, font_family="monospace",
+                            color=TEXT_SUB, selectable=True),
+                ], spacing=6),
+                bgcolor=IDLE_BG, padding=10, border_radius=10,
+            )
+        if kind == "question":
+            answered = row.get("answer") is not None
+            controls: list[ft.Control] = [
+                ft.Row(controls=[
+                    ft.Icon(ft.Icons.HELP_OUTLINE, size=16, color=WARN),
+                    ft.Text(text, size=FS_BODY, color=TEXT,
+                            weight=ft.FontWeight.BOLD, expand=True),
+                ], spacing=6),
+            ]
+            if answered:
+                controls.append(ft.Text(f"→ {row['answer']}", size=FS_SMALL,
+                                        color=TEXT_SUB))
+            else:
+                controls.append(ft.Row(
+                    controls=[
+                        ft.Button(
+                            content=option, key=f"agent-answer-{index}",
+                            on_click=lambda e, a=option:
+                                self._answer_question(a),
+                        )
+                        for index, option in enumerate(row.get("options") or [])
+                    ] + [ft.Button(
+                        content="Type an answer…", key="agent-answer-free",
+                        icon=ft.Icons.KEYBOARD,
+                        on_click=lambda e: self._focus_prompt())],
+                    wrap=True, spacing=8, run_spacing=8,
+                ))
+            return ft.Container(
+                content=ft.Column(controls=controls, spacing=8),
+                bgcolor=WARN_BG, padding=12, border_radius=10,
+                border=ft.Border.all(1, "#FFCC80"),
+            )
+        # action / memory / anything else: a compact chip
+        ok = row.get("ok", True)
+        if kind == "memory":
+            icon, bg, fg = ft.Icons.BOOKMARK_ADDED, IDLE_BG, TEXT_SUB
+        elif ok:
+            icon, bg, fg = ft.Icons.CHECK_CIRCLE, OK_BG, OK
+        else:
+            icon, bg, fg = ft.Icons.ERROR_OUTLINE, DANGER_BG, DANGER
+        return ft.Row(
+            controls=[ft.Container(
+                content=ft.Row(controls=[
+                    ft.Icon(icon, size=16, color=fg),
+                    ft.Text(text, size=FS_SMALL, color=fg, selectable=True),
+                ], spacing=6, tight=True),
+                bgcolor=bg, padding=ft.Padding(left=10, top=6, right=10,
+                                               bottom=6),
+                border_radius=20)],
+            alignment=ft.MainAxisAlignment.START,
+        )
+
+    def _agent_devices_panel(self) -> ft.Control:
+        """The tool list as the model sees it, with live state."""
+        self.agent_devices = ft.Column(
+            controls=self._agent_devices_rows(), spacing=10,
+            scroll=ft.ScrollMode.AUTO, expand=True, key="agent-devices")
+        return self.agent_devices
+
+    def _agent_devices_rows(self) -> list[ft.Control]:
+        caps = self._capabilities()
+        rows: list[ft.Control] = [
+            ft.Text("Devices the agent can use", size=FS_BODY,
+                    weight=ft.FontWeight.BOLD, color=TEXT),
+            ft.Text("Generated from pins.py — one schema for both sides.",
+                    size=FS_SMALL, color=TEXT_SUB),
+        ]
+        for tool in caps.tools:
+            state = self.states.get(tool.profile.bcm)
+            rows.append(ft.Column(controls=[
+                ft.Row(controls=[
+                    ft.Text(tool.name, size=FS_SMALL, color=TEXT,
+                            weight=ft.FontWeight.BOLD, expand=True,
+                            max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                    ft.Text(f"BCM {tool.profile.bcm}", size=FS_TINY,
+                            color=TEXT_FAINT),
+                ], spacing=6),
+                ft.Text(", ".join(tool.actions), size=FS_TINY,
+                        color=TEXT_SUB),
+                ft.Text(self._state_short(tool.profile, state), size=FS_TINY,
+                        color=TEXT_FAINT),
+            ], spacing=1))
+        return rows
+
+    @staticmethod
+    def _state_short(profile: PinProfile, state: PinState | None) -> str:
+        if state is None:
+            return "—"
+        if state.fault:
+            return f"fault: {state.fault}"
+        value = state.value
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        if value is None:
+            return "—"
+        return _format_reading(value, profile.unit or state.unit)
+
+    def _capabilities(self):
+        """One Capabilities instance, rebuilt only when facts change."""
+        cached = getattr(self, "_caps_cache", None)
+        if cached is None:
+            from capabilities import build_capabilities
+            cached = build_capabilities(self.agent_settings.facts_path)
+            self._caps_cache = cached
+        return cached
+
+    def _agent_state_text(self) -> str:
+        """One line summarising what the agent is told about the board."""
+        if not self.states:
+            return "no state yet — connect to the Pi to give the agent context"
+        bits: list[str] = []
+        for profile in pins.PROFILE.values():
+            state = self.states.get(profile.bcm)
+            if state is None or profile.role not in (Role.OUTPUT, Role.PWM,
+                                                     Role.INPUT, Role.SENSOR):
+                continue
+            bits.append(f"{profile.name} {self._state_short(profile, state)}")
+            if len(bits) == 4:
+                break
+        return " · ".join(bits)
+
+    def _apply_agent(self) -> None:
+        """Refresh the status chip, gating and the live context line."""
+        # A pending question is answered through the composer, so Send must be
+        # live even though the turn is still running. The row is UI state and
+        # avoids racing the worker's `pending_question` assignment.
+        asking = any(row.get("kind") == "question"
+                     and row.get("answer") is None for row in self.agent_rows)
+        if self.agent_status is not None:
+            if asking:
+                text, color = "waiting for your answer", WARN
+            elif not self.agent_settings.ready:
+                text, color = "no model configured", WARN
+            elif self.agent_busy:
+                text, color = "working…", WARN
+            elif self.connected:
+                text, color = f"ready · {self.agent_settings.label}", OK
+            else:
+                text, color = "waiting for the Pi…", TEXT_SUB
+            self.agent_status.value = text
+            self.agent_status.color = color
+        can_send = asking or (self.connected and self.agent_settings.ready
+                              and not self.agent_busy)
+        if self.agent_send is not None:
+            self.agent_send.disabled = not can_send
+            self.agent_send.opacity = 1.0 if can_send else 0.4
+        # The prompt stays editable while a turn runs: that is how the
+        # operator types an answer to an ask_user question.
+        if self.agent_stop is not None:
+            self.agent_stop.disabled = not self.agent_busy
+            self.agent_stop.opacity = 1.0 if self.agent_busy else 0.45
+        if self.agent_clear is not None:
+            # Clearing mid-turn would reset the history under the worker.
+            self.agent_clear.disabled = self.agent_busy
+            self.agent_clear.opacity = 0.4 if self.agent_busy else 1.0
+        if self.agent_state is not None:
+            self.agent_state.value = self._agent_state_text()
+        if self.agent_devices is not None:
+            self.agent_devices.controls = self._agent_devices_rows()
+
+    # -- settings ----------------------------------------------------------
+
+    def _open_agent_settings(self) -> None:
+        settings = self.agent_settings
+        base = ft.TextField(
+            label="Base URL", value=settings.base_url, key="agent-base-url",
+            hint_text="https://openrouter.ai/api/v1",
+            text_style=ft.TextStyle(size=FS_BODY))
+        # Show the exact URL that will be called: a typo like "/api/vi" is
+        # otherwise only visible in the error chip after a failed turn.
+        endpoint_preview = ft.Text(
+            "", size=FS_TINY, color=TEXT_SUB, selectable=True,
+            key="agent-endpoint-preview")
+
+        def refresh_endpoint(e: ft.ControlEvent | None = None) -> None:
+            raw = (base.value or "").strip().rstrip("/")
+            endpoint_preview.value = (
+                f"POST {raw}/chat/completions" if raw
+                else "POST <base URL>/chat/completions")
+
+        base.on_change = refresh_endpoint
+        refresh_endpoint()
+
+        def use_preset(url: str) -> None:
+            base.value = url
+            refresh_endpoint()
+            self.page.update()
+
+        presets = ft.Row(
+            controls=[
+                ft.Text("Quick fill:", size=FS_TINY, color=TEXT_SUB),
+                ft.TextButton(
+                    content="OpenRouter", key="agent-preset-openrouter",
+                    on_click=lambda e: use_preset(
+                        "https://openrouter.ai/api/v1")),
+                ft.TextButton(
+                    content="Ollama", key="agent-preset-ollama",
+                    on_click=lambda e: use_preset(
+                        "http://localhost:11434/v1")),
+            ],
+            spacing=4, wrap=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        model = ft.TextField(
+            label="Model", value=settings.model, key="agent-model",
+            hint_text="vendor/model", text_style=ft.TextStyle(size=FS_BODY))
+        key = ft.TextField(
+            label="API key", value=settings.api_key, key="agent-api-key",
+            password=True, can_reveal_password=True,
+            hint_text="blank for a local model",
+            text_style=ft.TextStyle(size=FS_BODY))
+        facts = ft.TextField(
+            label="Facts file (optional)", value=settings.facts_path or "",
+            key="agent-facts", hint_text="~/.config/picontrol/facts.json",
+            text_style=ft.TextStyle(size=FS_BODY))
+
+        def save(e: ft.ControlEvent) -> None:
+            self.agent_settings = AgentSettings(
+                base_url=base.value or "",
+                model=model.value or "",
+                api_key=key.value or "",
+                facts_path=facts.value or None,
+                stt_model=self.agent_settings.stt_model)
+            try:
+                self.agent_settings.save(AGENT_SETTINGS_PATH)
+            except OSError as ex:
+                self._push_log(f"could not save agent settings: {ex}", False)
+            self.agent = None          # rebuilt with the new endpoint
+            self._caps_cache = None    # facts path may have changed
+            self.page.pop_dialog()
+            self._apply_agent()
+            self.page.update()
+
+        def cancel(e: ft.ControlEvent) -> None:
+            self.page.pop_dialog()
+            self.page.update()
+
+        self.page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Agent model", size=FS_SECTION,
+                          weight=ft.FontWeight.BOLD),
+            content=ft.Column(controls=[
+                ft.Text("Any OpenAI-compatible endpoint with tool calling "
+                        "works. Include /v1: OpenRouter is "
+                        "https://openrouter.ai/api/v1, Ollama is "
+                        "http://localhost:11434/v1.",
+                        size=FS_SMALL, color=TEXT_SUB),
+                base, endpoint_preview, presets, model, key, facts,
+            ], spacing=12, tight=True, width=420),
+            actions=[
+                ft.TextButton(content="Cancel", on_click=cancel),
+                ft.Button(content="Save", key="agent-save",
+                          on_click=save),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        ))
+        self.page.update()
+
+    # -- sending -----------------------------------------------------------
+
+    async def _agent_send(self) -> None:
+        if self._session_lost:
+            return
+        prompt = self.agent_prompt
+        text = (prompt.value or "").strip() if prompt is not None else ""
+        if not text:
+            return
+        # A pending question consumes the next message as its answer, even
+        # though the turn is still running.
+        if self.pending_question is not None:
+            self._answer_question(text)
+            if prompt is not None:
+                prompt.value = ""
+            self.page.update()
+            return
+        if self.agent_busy:
+            return
+        if not (self.connected and self.agent_settings.ready):
+            self._apply_agent()
+            self.page.update()
+            return
+        if prompt is not None:
+            prompt.value = ""
+
+        self._stop_requested = False
+        self.agent_rows.append({"kind": "user", "text": text})
+        self.agent_rows = self.agent_rows[-AGENT_ROWS:]
+        self._refresh_transcript()
+
+        if self.agent is None:
+            self.agent = agent_mod.make_agent(
+                self.agent_settings,
+                transport=self._agent_transport,
+                ask_user=self._ask_user,
+                write_script=self._write_script_from_agent,
+            )
+        # Capture it: saving settings mid-turn sets self.agent to None, but the
+        # worker (and Stop) must keep using the agent that started the turn.
+        active = self.agent
+        self._active_agent = active
+        self.agent_busy = True
+        self._apply_agent()
+        self.page.update()
+
+        state = list(self.states.values())
+        threading.Thread(
+            target=self._agent_worker, args=(active, text, state, self.script),
+            daemon=True).start()
+        self.page.run_task(self._drain_agent_events)
+
+    def _agent_worker(self, agent: agent_mod.Agent, text: str, state,
+                      script) -> None:
+        """Runs off the UI thread; every event goes through the queue."""
+        try:
+            agent.turn(text, state, script,
+                       on_event=self.agent_events.put)
+        except Exception as ex:  # noqa: BLE001 — never kill the worker silently
+            self.agent_events.put(
+                AgentEvent("error", f"{type(ex).__name__}: {ex}"))
+        finally:
+            self.agent_events.put(None)   # sentinel: turn finished
+
+    def _agent_transport(self, op: Op) -> OpResult:
+        """Send one op and enqueue the exact exchange for the wire panel.
+
+        Runs on the worker thread, so it must not touch Flet controls: the
+        UI updates when the drain loop handles the `wire` event.
+        """
+        result = self.client.post_op(op)
+        self.agent_events.put(
+            AgentEvent("wire", extra={"op": op, "result": result}))
+        return result
+
+    async def _drain_agent_events(self) -> None:
+        while True:
+            drained = False
+            while True:
+                try:
+                    event = self.agent_events.get_nowait()
+                except queue.Empty:
+                    break
+                if event is None:
+                    self.agent_busy = False
+                    self._active_agent = None
+                    self.pending_question = None
+                    self._close_question("(stopped)" if self._stop_requested
+                                         else "(no answer)")
+                    self._stop_requested = False
+                    self._apply_agent()
+                    self._refresh_transcript()
+                    self.page.update()
+                    self._scroll_agent()
+                    return
+                self._handle_agent_event(event)
+                drained = True
+            if drained:
+                self._refresh_transcript()
+                self._apply_agent()
+                self.page.update()
+                self._scroll_agent()
+            await asyncio.sleep(AGENT_DRAIN_SECONDS)
+
+    def _handle_agent_event(self, event: AgentEvent) -> None:
+        kind = event.kind
+        if kind == "text":
+            self.agent_rows.append({"kind": "assistant", "text": event.text})
+        elif kind == "action":
+            ok = bool(event.result and event.result.ok)
+            self.agent_rows.append({"kind": "action", "text": event.text,
+                                    "ok": ok})
+            if event.result is not None:
+                self._push_log(f"agent: {event.text}", ok)
+        elif kind == "question":
+            self.agent_rows.append({
+                "kind": "question", "text": event.text,
+                "options": list(event.extra.get("options") or []),
+                "answer": None})
+        elif kind == "answer":
+            for row in reversed(self.agent_rows):
+                if row.get("kind") == "question" and row.get("answer") is None:
+                    row["answer"] = event.text
+                    break
+        elif kind == "memory":
+            self.agent_rows.append({"kind": "memory", "text": event.text,
+                                    "ok": True})
+        elif kind == "script":
+            self.agent_rows.append({
+                "kind": "script", "text": event.text,
+                "code": event.extra.get("code", ""),
+                "title": event.extra.get("title", "")})
+            self._push_log(
+                f"agent: script '{event.extra.get('title') or 'untitled'}' "
+                f"ready to run", True)
+        elif kind == "wire":
+            op = event.extra.get("op")
+            result = event.extra.get("result")
+            if isinstance(op, Op) and isinstance(result, OpResult):
+                self._record_wire(op, result)
+        elif kind == "error":
+            self.agent_rows.append({"kind": "error", "text": event.text})
+        self.agent_rows = self.agent_rows[-AGENT_ROWS:]
+
+    def _record_wire(self, op: Op, result: OpResult) -> None:
+        """Append the exact request/reply JSON to the (bounded) wire log."""
+        stamp = time.strftime("%H:%M:%S")
+        sent = protocol.encode_op(op).decode("utf-8")
+        got = protocol.encode_result(result).decode("utf-8")
+        self.agent_wire.append(f"{stamp} → {sent}")
+        self.agent_wire.append(f"{' ' * 8} ← {got}")
+        self.agent_wire = self.agent_wire[-AGENT_WIRE_LINES:]
+        if self.agent_wire_text is not None:
+            self.agent_wire_text.value = "\n".join(self.agent_wire)
+            self.agent_wire_text.color = CONSOLE_FG
+        if self.agent_wire_open:
+            self._scroll_wire()
+
+    def _toggle_agent_wire(self) -> None:
+        self.agent_wire_open = not self.agent_wire_open
+        if self.agent_wire_panel is not None:
+            self.agent_wire_panel.visible = self.agent_wire_open
+        if self.agent_wire_toggle is not None:
+            self.agent_wire_toggle.selected = self.agent_wire_open
+            self.agent_wire_toggle.icon = (
+                ft.Icons.VISIBILITY_OFF if self.agent_wire_open
+                else ft.Icons.CABLE)
+            self.agent_wire_toggle.tooltip = (
+                "Hide Pi traffic" if self.agent_wire_open
+                else "Show the exact ops sent to the Pi")
+        self.page.update()
+        if self.agent_wire_open:
+            self._scroll_wire()
+
+    def _scroll_wire(self) -> None:
+        if self._session_lost or self.agent_wire_box is None:
+            return
+        self.page.run_task(self._scroll_wire_task)
+
+    async def _scroll_wire_task(self) -> None:
+        if self.agent_wire_box is None:
+            return
+        try:
+            await self.agent_wire_box.scroll_to(offset=-1.0)
+        except Exception:  # noqa: BLE001 — session closed / control gone
+            pass
+
+    def _refresh_transcript(self) -> None:
+        if self.agent_list is None:
+            return
+        self.agent_list.controls = self._agent_row_widgets()
+
+    def _scroll_agent(self) -> None:
+        if self._session_lost or self.agent_list is None:
+            return
+        self.page.run_task(self._scroll_agent_task)
+
+    async def _scroll_agent_task(self) -> None:
+        if self.agent_list is None:
+            return
+        try:
+            await self.agent_list.scroll_to(offset=-1.0)
+        except Exception:  # noqa: BLE001 — session closed / control gone
+            pass
+
+    def _ask_user(self, question: str, options: list[str],
+                  timeout: float) -> str | None:
+        """Called from the worker thread; blocks until the UI answers."""
+        pending = _PendingQuestion()
+        self.pending_question = pending
+        try:
+            return pending.wait(timeout)
+        finally:
+            self.pending_question = None
+
+    def _answer_question(self, answer: str | None) -> None:
+        pending = self.pending_question
+        if pending is None:
+            return
+        pending.resolve(answer)
+        self.pending_question = None
+        if answer:
+            self._push_log(f"agent: answered '{answer}'", True)
+
+    def _close_question(self, answer: str) -> None:
+        """Resolve the newest unanswered question card (stop/timeout)."""
+        for row in reversed(self.agent_rows):
+            if row.get("kind") == "question" and row.get("answer") is None:
+                row["answer"] = answer
+                return
+
+    def _focus_prompt(self) -> None:
+        if self.agent_prompt is not None:
+            self.page.run_task(self.agent_prompt.focus)
+
+    def _agent_stop(self) -> None:
+        self._stop_requested = True
+        running = self._active_agent or self.agent
+        if running is not None:
+            running.cancel()
+        if self.pending_question is not None:
+            self.pending_question.resolve(None)
+            self.pending_question = None
+        self._close_question("(stopped)")
+        self._push_log("agent: stop requested", False)
+
+    def _clear_agent(self) -> None:
+        if self.agent_busy:
+            return          # disabled in the UI too: never reset under a turn
+        self.agent_rows = []
+        self.agent_wire = []
+        if self.agent_wire_text is not None:
+            self.agent_wire_text.value = "(no agent traffic yet)"
+            self.agent_wire_text.color = CONSOLE_MUTED
+        if self.agent is not None:
+            self.agent.reset()
+        self._refresh_transcript()
+        self.page.update()
+
+    def _write_script_from_agent(self, code: str, title: str) -> OpResult:
+        """Acknowledge the escape hatch; the UI work happens on the UI thread.
+
+        This runs inside the agent's worker thread, so it must not touch Flet
+        controls. The `script` event carries the code; the transcript renders a
+        card whose **Open in Script** button loads it (`_open_script`).
+        """
+        return OpResult(ok=True)
+
+    def _open_script(self, code: str) -> None:
+        self._load_script_into_editor(code)
+
+    def _load_script_into_editor(self, code: str) -> None:
+        """Replace the editor contents, then show the Script page.
+
+        `_render()` copies the *live* box's value back into `script_code`
+        first, so writing only the model attribute would be clobbered by the
+        stale widget. Update both, then rebuild.
+        """
+        self.script_code = code
+        self.script_caret = 0
+        self.script_span = (0, 0)
+        self.page_index = self.PAGE_SCRIPT
+        field = self.script_text_field
+        if field is not None:
+            field.value = code
+            field.selection = ft.TextSelection(base_offset=0, extent_offset=0)
+        self._render()
+        self._go_to_page(self.PAGE_SCRIPT)
 
     # ------------------------------------------------------------ actions ----
 

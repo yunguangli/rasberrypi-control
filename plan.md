@@ -12,6 +12,11 @@ Remote control of a Raspberry Pi's GPIO from a PC/laptop:
   interprets them into real gpiozero operations, logs every op on the console, and returns
   status / sensor values.
 
+**Long-term goal:** one agent that controls the board and whatever is attached to it, by
+typed or spoken commands. The current focus is the sensor/actuator bench (light,
+temperature, distance, motion, button); robot cars and hands are future skill layers, not
+current scope (see §10).
+
 **Hard constraints (user, 2026-10-06):**
 
 1. **Easy separation** — deployment to the Pi = copying 3 files (see §6). PC and Pi code are
@@ -46,8 +51,10 @@ both sides import so the wire contract has exactly one definition:
 
 ```
 ┌──────────────────────────── PC (Flet app, src/main.py) ────────────────────────────┐
-│  VIEW      Flet controls: Board strip, section cards, activity log                 │
-│  CONTROLLER  async handlers: send ops, poll loop, optimistic update + rollback      │
+│  VIEW        Flet controls: Board strip, device cards, transcript, activity log    │
+│  CONTROLLER  async handlers: send ops, poll loop, optimistic update + rollback     │
+│  AGENT       agent.py: model loop + ports (Model, transport, ask_user)             │
+│  DOMAIN      capabilities.py: tool schema, op compiler, learned facts              │
 └───────────────┬─────────────────────────────────────────────────────────────────────┘
                 │  HTTP + JSON  (src/protocol.py: encode/decode/validate)
 ┌───────────────▼──────────────── Raspberry Pi (src/pi.py) ───────────────────────────┐
@@ -67,11 +74,15 @@ both sides import so the wire contract has exactly one definition:
 - **Controller** = Flet event handlers + poll task (PC) / HTTP dispatch (Pi).
 - `protocol.py`/`pins.py` are **stdlib-only, Flet-free, gpiozero-free** (same rule as
   lanlink modules) → unit-testable without either side running.
+- The **agent layer** (`agent.py`, `capabilities.py`) is PC-side but equally
+  Flet-free/gpiozero-free, so it can later back an MCP server or a voice front end.
 - **Import boundary (enforced by tests, §7):**
 
 | File | Runs on | May import |
 |---|---|---|
-| `main.py` | PC | flet, stdlib, `pins`, `protocol` |
+| `main.py` | PC | flet, stdlib, `pins`, `protocol`, `agent`, `capabilities` |
+| `agent.py` | PC | stdlib, `capabilities`, `protocol` |
+| `capabilities.py` | PC | stdlib, `pins`, `protocol` |
 | `pi.py` | Pi (+ PC in `--dev`) | stdlib, **gpiozero**, `pins`, `protocol` |
 | `pins.py`, `protocol.py` | both | **stdlib only** |
 
@@ -121,6 +132,70 @@ class PinState:
 
 Role → allowed ops table lives next to the profile: `pi.py` rejects `pwm_write` on an INPUT
 with `400 {"ok": false, …}`; the GUI never builds a control that would fail.
+
+### Agent layer — typed natural language (2026-10-25)
+
+> Learner-facing walkthrough with diagrams: `README.md` → *Agent → How it works*.
+> This section is the implementation rationale.
+
+**Scope now: typed text only.** Voice input, MCP and scenes are later seams, not stubs.
+
+Execution tiers, narrowest first:
+
+1. **one device action** — covers most requests;
+2. **`blink`** — N on/off cycles on one output, the simple “blink 3 times” case;
+3. **`run_sequence`** — custom timing patterns (beep, sweep, melodies; up to 64
+   steps); each buzzer tone lasts 400 ms, so `wait_ms` sets the rhythm;
+4. **`write_script`** — escape hatch: offers code as a transcript card; **Open in Script**
+   loads it into the editor, and it **never auto-runs**.
+
+```
+user text
+  → Agent.turn()                       agent.py        (use case; blocking)
+  → Model.complete(messages, tools)    port → OpenAIChat adapter
+  → ToolCall(name, arguments)
+  → ToolCompiler.compile()             capabilities.py → protocol.Op
+  → transport(op)                      main.PiClient.post_op → POST /op
+  → OpResult → AgentEvent("action")    queue → UI chip
+```
+
+| Module | Responsibility | No knowledge of |
+|---|---|---|
+| `capabilities.py` | tool schema from `pins.PROFILE`; `ToolCompiler` (validate + compile to `Op`); `Facts` (aliases, JSON) | flet, gpiozero, HTTP |
+| `agent.py` | the loop, turn-atomic history, cancellation, `Model`/`transport`/`ask_user` ports, `OpenAIChat` adapter, `Settings` | flet, gpiozero |
+| `main.py` | Agent page: transcript, composer, question cards, settings dialog, worker thread + event queue | — |
+
+Decisions that matter:
+
+- **Ops, not generated Python.** The model can only emit the whitelisted tools, so it
+  cannot invent a pin or execute arbitrary code. Invalid calls raise `ToolError` with a
+  message the model can act on; nothing is sent.
+- **One source of truth.** The tool list is derived from `pins.PROFILE` + `pins.ROLE_OPS`
+  (the same table `pi.py` validates against). Tool names are sanitised
+  (`Light (ADC)` → `light_adc`); sentinel pins `-1/-2/-3` survive for `read`.
+- **Turn-atomic history.** History is a list of *complete turns*, never sliced mid-turn,
+  and every `role: tool` reply carries its `tool_call_id`. Six turns are kept.
+- **`ask_user` is a port.** The worker thread blocks on a `threading.Event`; the UI
+  resolves it from an option button or the composer. A timeout/no-answer becomes a tool
+  error, not a hang.
+- **Facts.** `remember` writes a flat JSON map atomically with mode `0600`; the compiler
+  resolves an alias before declaring a device unknown. The model is told the facts in
+  every system prompt.
+- **Readiness is UI state.** `Agent` has no `Settings` knowledge — `make_agent` wires
+  settings into ports, and the page gates Send on `settings.ready and connected`,
+  showing `no model configured` / `waiting for the Pi…`.
+- **Events are a queue.** `turn()` runs off the UI thread and pushes `AgentEvent`s; the
+  page drains them every 50 ms with a `None` sentinel ending the turn.
+- **Provider quirks are normalised.** Some free providers omit `tool_call.id` or truncate
+  the arguments JSON. Before a turn enters history, the assistant message is rebuilt from
+  the parsed calls with a synthesised id and valid JSON, so the next request cannot fail
+  with OpenRouter's `tool_call_id must be non-empty` 400; a bad call becomes a readable
+  tool error instead. An empty reply with `finish_reason=length` is surfaced as an error
+  rather than silently ending the turn (reasoning models can spend the whole output
+  budget; `MAX_OUTPUT_TOKENS` is 3000).
+- **The raw wire is visible.** The Agent page's **Pi traffic** panel (cable icon, hidden
+  by default) shows the exact `POST /op` body and reply for every agent op. The transport
+  enqueues the exchange, so it is rendered on the UI thread like any other event.
 
 ## 4. Wire protocol (v1)
 
@@ -240,15 +315,18 @@ hooks: `page.on_resize` delivers `width`/`height` (logical px), and
 on mobile — it **raises on desktop**, so call it only when `page.platform` is android/ios.
 
 - **One breakpoint**: `width < 600` = narrow mode; re-render the shell on `on_resize`.
-- **Narrow layout**: navigation moves to a bottom `NavigationBar` with three pages —
-  **Board | Control | Script**; the Board page shows the full **vertical pinout**
+- **Narrow layout**: navigation moves to a bottom `NavigationBar` with four pages —
+  **Board | Control | Script | Agent**; the Board page shows the full **vertical pinout**
   (20 rows × 2 cols, labels beside cells — the pinout.xyz style fits portrait naturally)
   with maximum detail per pin (physical #, BCM, alt function, family, wired device, live
   state, fault). Control starts directly with the device cards (no 1000 px board above
-  them) and Script has the whole page for editor + console.
+  them), Script has the whole page for editor + console, and Agent is a single column
+  (transcript, live-context line, pinned composer) without the device rail.
 - **Wide layout**: a fixed header, the compact **2×20 board strip pinned** above the paged
   area (so the whole header stays visible while scrolling), and `Tabs` for
-  **Board | Control | Script**. The Board tab is the same detailed view as the phone page.
+  **Board | Control | Script | Agent**. The Board tab is the same detailed view as the
+  phone page; the Agent tab adds a right-hand rail listing every tool the model can use,
+  with its live state.
 - **Install routes** (either way the phone reaches `pi.py`'s host:port over the same WiFi):
   1. **Native APK** — `flet build apk -v` (documented in README); needs Android SDK + JDK
      on the PC. HTTP runs from Python, not a browser → no CORS concerns.
@@ -261,7 +339,7 @@ App shell (the shell never scrolls; only the selected page does):
 ```
 Header (fixed)   "picontrol" · host:port field · quick-targets popup · Connect ·
                  status chip (dot + "connected · 12 ms" / "can't reach the Pi")
-Navigation       wide: Tabs (Board | Control | Script) under the pinned strip
+Navigation       wide: Tabs (Board | Control | Script | Agent) under the pinned strip
                  narrow: NavigationBar at the bottom
 Board page       every pin as a detail card: #physical, name, BCM, alt function,
                  family colour+label, wired device, live state chip, fault text,
@@ -273,6 +351,10 @@ Control page     Controls grid  (LEDs, relays, RGB swatches, buzzer pulse+tones,
 Script page      status chip · Run / Stop · Clear / Indent / Outdent / Examples,
                  editor (monospace) and console (stdout+stderr tail) side by side
                  on wide screens, stacked on narrow ones
+Agent page       transcript (user / assistant / action chips / question cards /
+                 script cards) · live-context line · composer + Send · Stop ·
+                 Clear · model settings · tool rail (wide only) ·
+                 Pi traffic panel (cable icon, raw POST /op JSON)
 ```
 
 Type scale (deliberately generous — read at arm's length, often on a phone):
@@ -296,16 +378,25 @@ Controller behaviours:
   (symlink support) — see AGENTS.md.
 - Layers:
   1. `protocol`/`pins` — pure unit tests (encode/decode/validate/role-ops table).
-  2. **Import-boundary test** — AST-parse all four files; fail if `pi.py`/`pins.py`/
-     `protocol.py` import anything outside `{stdlib} + gpiozero`, or if `main.py` imports
-     gpiozero. Fences the separation rule from day one.
+  2. **Import-boundary test** — AST-parse every source file; fail if `pi.py` imports
+     anything outside `{stdlib} + gpiozero`, if `main.py` imports gpiozero, or if
+     `agent.py`/`capabilities.py` grow a flet/gpiozero dependency. Fences the
+     separation rule from day one.
   3. **Deploy-smoke test** — copy `pi.py`+`pins.py`+`protocol.py` into `tmp_path`, run
      `python -c "import pi"` there with `GPIOZERO_PIN_FACTORY=mock`. This executes the
      actual copy-to-Pi workflow on every test run.
   4. `pi.py` dispatcher — `GPIOZERO_MOCK_PIN_FACTORY`, no network needed; assert op →
      `OpResult`, bad op → structured error.
-  5. GUI — existing `flet_app` fixture with the HTTP layer stubbed.
-- The pytest suite uses mock pins; **the suite never needs a real Pi**.
+  5. **Agent domain + loop** (`tests/test_agent.py`) — schema from `PROFILE`, compiler
+     ranges/sentinels/aliases, sequence pre-validation, facts persistence, the loop
+     with a fake `Model` and recording transport, call-id/history integrity,
+     `ask_user`, cancellation, step budget, plus a localhost HTTP contract test for
+     `OpenAIChat` (path, auth header, tool-call parsing, 401).
+  6. **Agent page** (`tests/test_agent_page.py`) — headless: builds `App` against a
+     stub `Page`, so the worker thread, event queue, question handshake, settings
+     dialog and script escape hatch run without Flutter.
+  7. GUI — existing `flet_app` fixture with the HTTP layer stubbed (all four pages).
+- The pytest suite uses mock pins; **the suite never needs a real Pi or a model**.
 
 ## 8. Build order — status 2026-10-06
 
@@ -328,9 +419,48 @@ Controller behaviours:
    manual `uv run flet run` look and a real-Pi run.
 8. ✅ `pyproject.toml`: gpiozero in the dev group (2.x for `uv run pytest`; the Pi
    target 1.6.2 is exercised with a separate 3.11/1.6.2 environment — see AGENTS.md).
+9. ✅ `src/capabilities.py` — domain layer: tool schema generated from `pins.PROFILE`,
+   `ToolCompiler` (validate → `protocol.Op`), `Facts` (atomic JSON aliases).
+10. ✅ `src/agent.py` — use case + ports: `Agent` loop with turn-atomic history,
+    cancellation and event stream; `Model`/`transport`/`ask_user` ports;
+    `OpenAIChat` (stdlib urllib, proxy-free); `Settings` (env + JSON).
+11. ✅ Agent page in `src/main.py` — fourth page, transcript + action chips +
+    question cards + composer, model-settings dialog (presets, lookalike-URL
+    repair, endpoint preview), worker thread/event queue, script escape hatch,
+    and a collapsible raw **Pi traffic** panel. `blink` tool added for the
+    common N-times pattern; provider tool-call quirks (missing ids, truncated
+    arguments) are normalised. `tests/test_agent.py` (52) and
+    `tests/test_agent_page.py` (19); `tests/test_main.py` covers four pages.
+12. ✅ Live run against OpenRouter (`openrouter/free` then
+    `nvidia/nemotron-3-ultra-550b-a55b:free`): on/off, blink, wire panel, and
+    the bridge round trip verified. Remaining: voice (cloud STT) and an MCP
+    server over the same `capabilities.py` tools.
 
 ## 9. Out of scope (v1)
 
 - lanlink-based discovery (host:port entry only; lift `discovery.py` later if typing IPs
   gets old), push/SSE sensor streaming, light sensor without ADC, auth (LAN-only; add a
   shared token if the network isn't trusted).
+- **Agent follow-ups (seams exist, features not built):** voice input (cloud STT; the
+  `PICONTROL_STT_MODEL` setting is reserved), an MCP server exposing the same tool
+  schema, and multi-step scenes saved as named sequences. The agent is typed-text only
+  for now, and `write_script` deliberately stops at the editor.
+
+## 10. Current focus and roadmap (2026-10-25)
+
+The goal is one agent controlling the board and its gadgets, typed or spoken. The
+current focus is the beginner sensor bench; cars and hands are deliberately deferred.
+
+| Stage | Work | State |
+|---|---|---|
+| **Now** | Typed agent + all current actuators/sensors; tool schema from `pins.PROFILE`; Pi traffic panel | done |
+| **Next** | Beginner sensor bench: light (MCP3008/LDR), temperature (DHT22/CPU), distance (HC-SR04), motion (PIR), button, load — wire, read, document | in progress |
+| **Then** | Voice input: push-to-talk → cloud STT → editable transcript → the same agent | planned |
+| **Later** | Robot skill layer: car (differential drive + Pi-side watchdog), hand (servo bank + angle limits) | future |
+| **Later** | MCP server + named scenes | future |
+
+Why this order: the sensor bench proves the read path (sensor → `pi.py` → op → agent →
+plain-English answer) and the wiring/safety habits. Voice is a thin front end to the
+same `Agent.turn(text)`, so it is useful only once the skills exist. A car or hand adds
+a **skill layer** — higher-level tools plus Pi-side safety such as a motor watchdog and
+servo limits — rather than changing the agent or the bridge contract.

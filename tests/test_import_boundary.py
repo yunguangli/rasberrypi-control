@@ -21,7 +21,7 @@ STDLIB = sys.stdlib_module_names  # Python >= 3.10
 
 # filename -> allowed top-level import roots
 BOUNDARY = {
-    "main.py":     {"flet", "pins", "protocol"},
+    "main.py":     {"flet", "pins", "protocol", "agent", "capabilities"},
     # adafruit_dht/board: optional DHT22 driver, imported lazily inside
     # _dht22() — absent on most machines (the deploy test imports pi
     # without it, so a top-level import of either would still fail).
@@ -31,6 +31,11 @@ BOUNDARY = {
                     "adafruit_dht", "board"},
     "pins.py":     set(),
     "protocol.py": set(),
+    # PC-side agent: the domain layer (schema + validation) and the use case
+    # (loop + ports). Both must stay free of flet and gpiozero so the same
+    # code can drive the GUI today and an MCP server later.
+    "capabilities.py": {"pins", "protocol"},
+    "agent.py":        {"capabilities", "protocol"},
 }
 
 

@@ -14,14 +14,16 @@ Control the Pi from the GUI on your PC/phone; watch/touch the hardware.
 
 ```bash
 pip install "gpiozero==1.6.2" "setuptools<81"   # Pi target: Python 3.11 + gpiozero 1.6.2
-python3 pi.py --port 8642              # sections 1–11
-python3 pi.py --port 8642 --allow-code # + section 12 (script tests)
+python3 pi.py --port 8642              # sections 1–11, 13 (read-only agent tests)
+python3 pi.py --port 8642 --allow-code # + section 12 and the script escape hatch
 python3 pi.py --help                   # list every flag
 ```
 → banner `picontrol bridge listening on 0.0.0.0:8642 [live GPIO via RPiGPIOFactory...]`
 
 All flags (`--host`, `--port`, `--dev`, `--allow-code`) are documented in
 `README.md`. Script tests need `--allow-code`; everything else works without it.
+Agent tests (§13) need a configured model (OpenRouter key or local Ollama) and a
+reachable bridge.
 
 **On the PC:** `uv run flet run` → enter `<pi-ip>:8642` → **Connect**
 (green dot, `connected · N ms`).
@@ -55,8 +57,8 @@ All flags (`--host`, `--port`, `--dev`, `--allow-code`) are documented in
 
 | ID | GUI action | Verification |
 |----|-----------|--------------|
-| HW-01 | Wide window (≥ 600 px) | Header (target + status) stays fixed while the page scrolls; the 2×20 board strip is pinned above the **Board / Control / Script** tabs; Script is one click away |
-| HW-02 | Phone portrait (< 600 px) | Bottom navigation **Board · Control · Script**; Control starts directly with the device cards (no full board above them); Script shows the editor and console stacked |
+| HW-01 | Wide window (≥ 600 px) | Header (target + status) stays fixed while the page scrolls; the 2×20 board strip is pinned above the **Board / Control / Script / Agent** tabs; Script and Agent are one click away |
+| HW-02 | Phone portrait (< 600 px) | Bottom navigation **Board · Control · Script · Agent**; Control starts directly with the device cards (no full board above them); Script shows the editor and console stacked; Agent is one column with the composer at the bottom |
 | HW-03 | Open the **Board** page | 40 detail cards: physical #, GPIO name, BCM, alt function, function family, wired device, live state chip; legend plus a **Wired only** filter |
 | HW-04 | Tap a wired output on the Board page (e.g. #11 Status LED) | Same toggle as its Control card; the chip follows within one poll |
 | HW-05 | Resize/rotate across 600 px | Tabs ↔ bottom nav switch, the current page is kept, no duplicated controls, nothing needs a restart |
@@ -193,6 +195,51 @@ you also want the job's output on the Pi's terminal while testing.
 | HW-128 | Script prints thousands of lines | Output pane keeps only the tail (≤ 200 lines / 16 KiB); GUI stays responsive |
 | HW-129 | With a job running, `Ctrl-C` / SIGTERM the bridge | Console prints `stopped the running script` before `switched off N output(s)`; no orphaned Python process on the Pi (`ps -ef | grep python`) |
 
+## 13. Agent — typed natural language
+
+Requires a **tool-calling** model: OpenRouter (cloud) or Ollama (local). Configure
+it with the gear on the Agent page or the `PICONTROL_LLM_*` variables
+(`README.md` → *Agent*). The bridge can stay in normal mode; the script escape
+hatch additionally needs `--allow-code`.
+
+The expected reply is an **action chip** (e.g. `status_led.on → on`) plus one or
+two sentences; every chip is mirrored in the activity log and the Pi console
+shows the real op.
+
+| ID | GUI action | Verification |
+|----|-----------|--------------|
+| HW-130 | Open **Agent** with no model configured | Status `no model configured`; Send disabled (40 % opacity); the gear opens the settings dialog with Base URL / Model / API key / Facts file |
+| HW-131 | Save OpenRouter settings (URL, tool-capable model, `sk-or-…` key) | Status `ready · <model> @ openrouter.ai/api/v1`; Send enabled; the dialog previews `POST …/api/v1/chat/completions`; `ls -l ~/.config/picontrol/agent.json` shows mode `-rw-------` |
+| HW-132 | Type `turn on the status LED` → Send | Action chip `status_led.on → on`; **LED lights**; Pi console shows exactly one `digital_write 17 = 1`; no approve step |
+| HW-133 | Then type `turn it off` | The follow-up uses context (no re-explaining); LED goes dark; chip `status_led.off → off` |
+| HW-134 | `blink the status LED three times` | `blink` (or `run_sequence` for a custom pattern) runs on/off ×3 with pauses; LED blinks three times; one chip per step; turn ends with a short reply |
+| HW-135 | `turn on the LED` (both LEDs exist, nothing learned) | A **question card** appears with tappable `Status LED` / `RGB LED`; tapping `Status LED` shows the answer, a `remembered led = …` chip, then the action chip |
+| HW-136 | Send `turn on the LED` again | No question this time — goes straight to the remembered device; `PICONTROL_FACTS_PATH` JSON contains the alias |
+| HW-137 | Energise relay 1 + motor, then `turn everything off` | `all_off` chip; relay clicks off, motor stops, LED dark; one panic op on the console |
+| HW-138 | `what's the room temperature?` | A `read` op (no write), reply quotes the DHT22 value in °C; the Room temp card agrees |
+| HW-139 | `make me a coffee` | Polite refusal / explanation; **zero ops** on the Pi console; no invented device |
+| HW-140 | `set the desk dimmer to 500%` | Either the model asks/clamps, or a red chip shows the `0..100` range error; **nothing out of range reaches the Pi** |
+| HW-141 | Break the endpoint (revoke the key or disconnect the network) and send a command | Red error chip with a readable reason; GUI stays responsive; Send re-enables. Restore the key → the next turn works without restarting |
+| HW-142 | Start a long `run_sequence` (e.g. 20 blinks), press **Stop** | Stops between steps (the in-flight request completes); turn ends with `stopped`; hardware is left in a safe state; Send re-enables |
+| HW-143 | Trigger a question, then press **Stop** | The question resolves as unanswered, the turn ends `stopped`, no worker left blocked |
+| HW-144 | `write a script that blinks GPIO17` (bridge with `--allow-code`) | A **script card** with a preview + **Open in Script**; the editor is filled and the Script page opens; **nothing runs** until you press Run on Pi. Without `--allow-code`, Run stays disabled |
+| HW-145 | Press **Clear** on the Agent page | Transcript returns to the empty state with suggestions; the next `turn it off` has no prior context (the agent asks what) |
+| HW-146 | Inspect the transcript, activity log and settings file after several turns | The API key never appears in the transcript/log; the settings file is `0600`; facts contain only aliases, no key |
+| HW-147 | Point the GUI at an unreachable host (or stop `pi.py`) | Agent status `waiting for the Pi…`, Send disabled; restart the bridge → status `ready` and Send re-enables on the next poll |
+| HW-148 | Phone portrait, Agent page | Single column, composer reachable, question options tappable, no horizontal scroll; the same turn controls the same hardware |
+| HW-149 | Remember an alias, quit and relaunch the GUI | `turn on the LED` still resolves without asking (facts file persisted); with the facts file deleted it asks again |
+| HW-150 | Click the **cable icon** on the Agent page, run `turn on the status LED`, click it again | The **Pi traffic** panel shows the exact `POST /op` body and reply (`{"op":"digital_write","pin":17,"value":true,…}` / `{"ok":true,…}`); hidden by default, the same icon hides it, and **Clear** empties it |
+| HW-151 | With a weaker/free-router model, ask for a sequence it may malform (e.g. `blink 3 times`) | Even if the model omits a tool-call id or sends truncated arguments, the turn ends with a readable tool error or a successful blink — never OpenRouter's `tool_call_id must be non-empty` / HTTP 400 |
+| HW-152 | `play Happy Birthday with C major tones` on the buzzer | A `run_sequence` of tone steps plays the melody (up to 64 steps; each tone 400 ms, waits set the rhythm); if the model exhausts its output budget, a red `finish_reason=length` chip appears instead of silence |
+| HW-153 | `what's the room temperature?` | One `read` op on pin 4; reply in °C, plausible; no pin is driven. With the DHT22 driver missing, a readable fault/answer — no crash |
+| HW-154 | `how bright is it?` (MCP3008 + LDR) | One `read` op on the sentinel pin -1; cover the LDR → % drops, shine a torch → % rises |
+| HW-155 | `how far is the wall?` with an object at 30 cm / 1 m | One `read` op on pin 5; reply ≈ 0.30 m / ≈ 1.0 m; move your hand and the value tracks |
+| HW-156 | `is there motion?` (PIR) | One `digital_read` on pin 25; `motion` while you wave, `idle` when still |
+| HW-157 | `is the door open?` (push button) | One `digital_read` on pin 24; `pressed` / `released` follows the physical button |
+| HW-158 | `how hot is the Pi?` / `what's the system load?` | `read` on the sentinel pins -2 / -3; values agree with `thermal_zone0` and `/proc/loadavg` |
+| HW-159 | `what's the humidity?` or `what's the CO2 level?` (no such sensor) | A clear “not available” reply and **zero ops** — the agent must not invent a reading |
+| HW-160 | `read all the sensors` | Several read chips (read-only); no writes; the GUI stays responsive and the Pi console shows only `read` / `digital_read` lines |
+
 ---
 
 ## Cross-checking tools
@@ -210,6 +257,8 @@ you also want the job's output on the Pi's terminal while testing.
   buzzer, inputs) all pass with no bridge tracebacks.
 - **Full rig sign-off:** additionally HW-50…HW-115 on the actual wired set.
 - **Script sign-off:** HW-120…HW-126 with pi.py started with `--allow-code`.
+- **Agent sign-off:** HW-130…HW-160 with a tool-capable model; every action the
+  agent takes is visible as a chip **and** as one op on the Pi console.
 - Any `ERR` badge must show a *readable reason* (missing driver, SPI0 not
   enabled, echo missing) — a raw traceback on a card is a failure even if the
   rest works.
